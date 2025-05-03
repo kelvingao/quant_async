@@ -16,19 +16,22 @@ from ezib_async import ezIBAsync
 
 class Reports:
     
-    def __init__(self, ib_host='127.0.0.1', ib_port=4001, clientId=0, 
+    def __init__(self, ibhost='127.0.0.1', ibport=4001, ibclient=0, 
                  static_dir=None, templates_dir=None, password=None, **kwargs):
         """
         Initialize the Reports class.
         
         Args:
-            host (str): IB Gateway/TWS host address
-            port (int): IB Gateway/TWS port
-            clientId (int): Client ID for IB connection
-            static_dir (Path or str, optional): Directory for static files. 
+            ibhost (str): IB Gateway/TWS host address
+            ibport (int): IB Gateway/TWS port
+            ibclient (int): Client ID for IB connection
+            static (Path or str, optional): Directory for static files. 
                 Defaults to _webapp/static in the package directory.
-            templates_dir (Path or str, optional): Directory for templates. 
+            templates (Path or str, optional): Directory for templates. 
                 Defaults to _webapp/templates in the package directory.
+            password (str, optional): Password for authentication. 
+                Defaults to a hash of the current date.
+            **kwargs: Additional keyword arguments.
         """
 
         # initialize the Interactive Brokers client
@@ -36,13 +39,13 @@ class Reports:
         self.app = None
         
         # IB connection parameters
-        self.ib_host = ib_host
-        self.ib_port = ib_port
-        self.clientId = clientId
+        self.ibhost = ibhost
+        self.ibport = ibport
+        self.ibclient = ibclient
 
         # override args with any (non-default) command-line args
-        self.args = {arg: val for arg, val in locals().items(
-        ) if arg not in ('__class__', 'self', 'kwargs')}
+        self.args = {arg: val for arg, val in locals().items()
+                    if arg not in ('__class__', 'self', 'kwargs')}
         self.args.update(kwargs)
         self.args.update(self.load_cli_args())
         
@@ -54,17 +57,14 @@ class Reports:
         
         # return
         self._password = password if password is not None else hashlib.sha1(
-            str(datetime.datetime.now()).encode()).hexdigest()[:6]
+            str(datetime.datetime.now().date()).encode('utf-8')).hexdigest()[:8]
     
     # ---------------------------------------
     def setup_app(self):
         """
-        Initialize and configure the FastAPI application.
-        
-        Returns:
-            FastAPI: Configured FastAPI application
+        Set up the FastAPI application.
         """
-        # Initialize FastAPI app with lifespan
+        # Create FastAPI app with lifespan
         self.app = FastAPI(lifespan=self.lifespan)
         
         # Add static files route
@@ -76,7 +76,7 @@ class Reports:
         # Add CORS middleware
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],  # You can restrict this to specific origins if needed
+            allow_origins=["*"],
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
@@ -109,50 +109,30 @@ class Reports:
                 response.set_cookie(key="password", value=password)
                 return response
             return Response(content="no")
-        
+            
         @self.app.get("/dashboard")
         async def dashboard_route(request: Request):
             # Your dashboard implementation
             return self.templates.TemplateResponse('dashboard.html', {"request": request})
     
     # ---------------------------------------
-    @property
-    def lifespan(self):
-        """
-        Create and return the lifespan context manager for FastAPI.
-        
-        Returns:
-            function: Async context manager for FastAPI lifespan
-        """
-        @asynccontextmanager
-        async def _lifespan(app: FastAPI):
-            # Startup: Connect to IB when FastAPI starts
-            try:
-                await self.ibConn.connectAsync(self.ib_host, self.ib_port, clientId=self.clientId)
-                print(f"Connected to IB at {self.ib_host}:{self.ib_port}")
-            except Exception as e:
-                print(f"Error connecting to IB: {e}")
-            
-            yield  # Allows the application to continue running
-            
-            # Shutdown: Disconnect IB when FastAPI shuts down
-            if self.ibConn.isConnected:
-                self.ibConn.disconnect()
-                print("Disconnected from IB")
-                
-        return _lifespan
-
-    # ---------------------------------------
     def load_cli_args(self):
         """
-        Parse command line arguments and return only the non-default ones
-
-        :Retruns: dict
-            a dict of any non-default args passed on the command-line.
+        Parse command line arguments and return only the non-default ones.
+        
+        Returns:
+            dict: A dict of any non-default args passed on the command-line.
         """
-        parser = argparse.ArgumentParser(description='QuantAsync Reporting',
-                                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
+        parser = argparse.ArgumentParser(
+            description='Quant Async Reports',
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+            
+        parser.add_argument('--ibhost', default=self.args['ibhost'],
+                          help='IB TWS/GW Server hostname', required=False)
+        parser.add_argument('--ibport', default=self.args['ibport'],
+                          help='TWS/GW Port to use', required=False)
+        parser.add_argument('--ibclient', default=self.args['ibclient'],
+                          help='TWS/GW Client ID', required=False)
         parser.add_argument('--nopass',
                             help='Skip password for web app (flag)',
                             action='store_true')
@@ -160,10 +140,39 @@ class Reports:
         # only return non-default cmd line args
         # (meaning only those actually given)
         cmd_args, _ = parser.parse_known_args()
-        args = {arg: val for arg, val in vars(
-            cmd_args).items() if val != parser.get_default(arg)}
+        args = {k: v for k, v in vars(cmd_args).items() if v != parser.get_default(k)}
         return args
     
+    # ---------------------------------------
+    @property
+    def lifespan(self):
+        """
+        Create a lifespan context manager for FastAPI.
+        
+        Returns:
+            asynccontextmanager: A context manager for FastAPI lifespan.
+        """
+        @asynccontextmanager
+        async def _lifespan(app: FastAPI):
+            # Startup: Connect to IB when FastAPI starts
+            try:
+                await self.ibConn.connectAsync(
+                    self.args['ibhost'], self.args['ibport'], clientId=self.args['ibclient'])
+                print(f"Connected to IB at {self.ibhost}:{self.ibport}")
+            except Exception as e:
+                print(f"Error connecting to IB: {e}")
+            
+            yield
+            
+            # Shutdown: Disconnect from IB when FastAPI shuts down
+            try:
+                await self.ibConn.disconnect()
+                print("Disconnected from IB")
+            except Exception as e:
+                print(f"Error disconnecting from IB: {e}")
+        
+        return _lifespan
+
     # ---------------------------------------
     def run(self, host="0.0.0.0", port=8000):
         """
