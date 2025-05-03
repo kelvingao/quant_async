@@ -2,6 +2,10 @@ import signal
 import argparse
 import asyncio
 import logging
+import sys
+import os
+import tempfile
+import pickle
 
 # Import ezib_async
 from ezib_async import ezIBAsync
@@ -20,12 +24,18 @@ class Blotter:
         ib_host (str, optional): IB TWS/GW Server hostname. Defaults to "localhost".
         ib_port (int, optional): TWS/GW Port to use. Defaults to 4001.
         clientId (int, optional): TWS/GW Client ID. Defaults to 999.
+        name (str, optional): Name of the blotter instance. Defaults to class name.
         **kwargs: Additional keyword arguments.
     """
 
-    def __init__(self, ib_host="localhost", ib_port=4001, clientId=999, **kwargs):
+    def __init__(self, ib_host="localhost", ib_port=4001, clientId=999, name=None, **kwargs):
         # Initialize class logger
         self.logger = logging.getLogger("quant_async.blotter")
+        
+        # Set blotter name
+        self.name = str(self.__class__).split('.')[-1].split("'")[0].lower()
+        if name is not None:
+            self.name = name
         
         # IB connection parameters
         self.ib_host = ib_host
@@ -38,8 +48,111 @@ class Blotter:
         self.args.update(kwargs)
         self.args.update(self.load_cli_args())
         
+        # Initialize args cache file path
+        self.args_cache_file = os.path.join(tempfile.gettempdir(), f"{self.name}.quant_async")
+        
+        # Flag to track if this is a duplicate run
+        self.duplicate_run = False
+        
         # Initialize IB connection
         self.ibConn = ezIBAsync()
+    
+    # ---------------------------------------
+    @staticmethod
+    async def _blotter_file_running():
+        """
+        Check if the blotter process is running.
+        
+        Returns:
+            bool: True if the process is running, False otherwise.
+        """
+        try:
+            # Create a subprocess to run pgrep
+            command = f'pgrep -f {sys.argv[0]}'
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            # Wait for the process to complete and get output
+            stdout, _ = await process.communicate()
+            
+            # Process the output
+            stdout_list = stdout.decode('utf-8').strip().split('\n')
+            stdout_list = list(filter(None, stdout_list))
+            
+            return len(stdout_list) > 0
+        except Exception as e:
+            logging.error(f"Error checking if blotter is running: {e}")
+            return False
+    
+    # ---------------------------------------
+    async def _check_unique_blotter(self):
+        """
+        Check if another instance of this blotter is already running.
+        If another instance is running, exit with an error.
+        """
+        try:
+            # Check if args cache file exists
+            if os.path.exists(self.args_cache_file):
+                # Temp file found - check if process is really running
+                # or if this file wasn't deleted due to crash
+                if not await self._blotter_file_running():
+                    # Process not running, remove old cache file
+                    await self._remove_cached_args()
+                else:
+                    # Process is running, this is a duplicate
+                    self.duplicate_run = True
+                    self.logger.error(f"Blotter '{self.name}' is already running...")
+                    sys.exit(1)
+            
+            # Write current args to cache file
+            await self._write_cached_args()
+            self.logger.info(f"Started Blotter instance: {self.name}")
+            
+        except Exception as e:
+            self.logger.error(f"Error checking unique blotter: {e}")
+            sys.exit(1)
+    
+    # ---------------------------------------
+    async def _remove_cached_args(self):
+        """Remove cached arguments file."""
+        if os.path.exists(self.args_cache_file):
+            try:
+                os.remove(self.args_cache_file)
+                self.logger.debug(f"Removed cached args file: {self.args_cache_file}")
+            except Exception as e:
+                self.logger.error(f"Error removing cached args file: {e}")
+    
+    # ---------------------------------------
+    async def _read_cached_args(self):
+        """
+        Read cached arguments from file.
+        
+        Returns:
+            dict: Cached arguments or empty dict if file doesn't exist.
+        """
+        if os.path.exists(self.args_cache_file):
+            try:
+                with open(self.args_cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                self.logger.error(f"Error reading cached args: {e}")
+        return {}
+    
+    # ---------------------------------------
+    async def _write_cached_args(self):
+        """Write arguments to cache file."""
+        try:
+            with open(self.args_cache_file, 'wb') as f:
+                pickle.dump(self.args, f)
+            
+            # Set file permissions
+            os.chmod(self.args_cache_file, 0o666)
+            self.logger.debug(f"Wrote cached args to: {self.args_cache_file}")
+        except Exception as e:
+            self.logger.error(f"Error writing cached args: {e}")
     
     # ---------------------------------------
     def load_cli_args(self):
@@ -92,6 +205,9 @@ class Blotter:
         self.ibConn.callback = self.ibCallback
         
         try:
+            # Check for unique blotter instance
+            await self._check_unique_blotter()
+            
             # Connect to IB
             await self.ibConn.connectAsync(
                 host=self.args['ib_host'],
@@ -136,6 +252,8 @@ class Blotter:
         if self.ibConn.isConnected:
             await self.ibConn.disconnect()
             self.logger.info("Disconnected from IB")
+        # Remove cached args file
+        await self._remove_cached_args()
        
             
 if __name__ == "__main__":
