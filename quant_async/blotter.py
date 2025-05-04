@@ -17,10 +17,6 @@ path = {
     "caller": os.path.dirname(os.path.realpath(sys.argv[0]))
 }
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
 class Blotter:
     """
     Blotter class for handling Interactive Brokers connections and market data.
@@ -40,7 +36,7 @@ class Blotter:
     def __init__(self, ibhost="localhost", ibport=4001, ibclient=999, name=None, 
                  symbols="symbols.csv", orderbook=False, **kwargs):
         # Initialize class logger
-        self.logger = logging.getLogger("quant_async.blotter")
+        self._logger = logging.getLogger("quant_async.blotter")
         
         # Set blotter name
         self.name = str(self.__class__).split('.')[-1].split("'")[0].lower()
@@ -97,7 +93,7 @@ class Blotter:
             
             return len(stdout_list) > 0
         except Exception as e:
-            logging.error(f"Error checking if blotter is running: {e}")
+            self._logger.error(f"Error checking if blotter is running: {e}")
             return False
     
     # ---------------------------------------
@@ -117,15 +113,15 @@ class Blotter:
                 else:
                     # Process is running, this is a duplicate
                     self.duplicate_run = True
-                    self.logger.error(f"Blotter '{self.name}' is already running...")
+                    self._logger.error(f"Blotter '{self.name}' is already running...")
                     sys.exit(1)
             
             # Write current args to cache file
             await self._write_cached_args()
-            self.logger.info(f"Started Blotter instance: {self.name}")
+            self._logger.info(f"Started Blotter instance: {self.name}")
             
         except Exception as e:
-            self.logger.error(f"Error checking unique blotter: {e}")
+            self._logger.error(f"Error checking unique blotter: {e}")
             sys.exit(1)
     
     # ---------------------------------------
@@ -134,9 +130,9 @@ class Blotter:
         if os.path.exists(self.args_cache_file):
             try:
                 os.remove(self.args_cache_file)
-                self.logger.debug(f"Removed cached args file: {self.args_cache_file}")
+                self._logger.debug(f"Removed cached args file: {self.args_cache_file}")
             except Exception as e:
-                self.logger.error(f"Error removing cached args file: {e}")
+                self._logger.error(f"Error removing cached args file: {e}")
     
     # ---------------------------------------
     async def _read_cached_args(self):
@@ -151,7 +147,7 @@ class Blotter:
                 with open(self.args_cache_file, 'rb') as f:
                     return pickle.load(f)
             except Exception as e:
-                self.logger.error(f"Error reading cached args: {e}")
+                self._logger.error(f"Error reading cached args: {e}")
         return {}
     
     # ---------------------------------------
@@ -163,9 +159,9 @@ class Blotter:
             
             # Set file permissions
             os.chmod(self.args_cache_file, 0o666)
-            self.logger.debug(f"Wrote cached args to: {self.args_cache_file}")
+            self._logger.debug(f"Wrote cached args to: {self.args_cache_file}")
         except Exception as e:
-            self.logger.error(f"Error writing cached args: {e}")
+            self._logger.error(f"Error writing cached args: {e}")
     
     # ---------------------------------------
     def load_cli_args(self):
@@ -202,7 +198,7 @@ class Blotter:
         Watch the symbols file for changes and update subscriptions accordingly.
         Based on the original synchronous implementation but converted to async.
         """
-        self.logger.info(f"Starting to watch symbols file: {self.symbols}")
+        self._logger.debug(f"Starting to watch symbols file: {self.symbols}")
         
         # Initialize tracking variables
         first_run = True
@@ -213,7 +209,7 @@ class Blotter:
             try:
                 # Check if file exists
                 if not os.path.exists(self.symbols):
-                    self.logger.info(f"Creating symbols file: {self.symbols}")
+                    self._logger.info(f"Creating symbols file: {self.symbols}")
                     # Create empty symbols file with required columns
                     df = pd.DataFrame(columns=['symbol', 'secType', 'exchange', 
                                              'currency', 'expiry', 'strike', 'right'])
@@ -231,7 +227,7 @@ class Blotter:
                     # Handle empty file
                     if db_size == 0:
                         if prev_contracts:
-                            self.logger.info('Empty symbols file, canceling all market data...')
+                            self._logger.info('Empty symbols file, canceling all market data...')
                             for contract in prev_contracts:
                                 contract_obj = self.ibConn.createContract(*contract)
                                 await self.ibConn.cancelMarketData(contract_obj)
@@ -306,7 +302,7 @@ class Blotter:
                             
                             # Log the addition
                             contract_string = str(contract[0])  # Use symbol as identifier
-                            self.logger.info(f'Contract Added [{contract_string}]')
+                            self._logger.info(f'Contract Added [{contract_string}]')
                     else:
                         # Cancel market data for removed contracts
                         if contracts != prev_contracts:
@@ -319,7 +315,7 @@ class Blotter:
                                     
                                     # Log the removal
                                     contract_string = str(contract[0])  # Use symbol as identifier
-                                    self.logger.info(f'Contract Removed [{contract_string}]')
+                                    self._logger.info(f'Contract Removed [{contract_string}]')
                     
                             # Request market data for new contracts
                             for contract in contracts:
@@ -331,7 +327,7 @@ class Blotter:
                                     
                                     # Log the addition
                                     contract_string = str(contract[0])  # Use symbol as identifier
-                                    self.logger.info(f'Contract Added [{contract_string}]')
+                                    self._logger.info(f'Contract Added [{contract_string}]')
                     
                     # Update previous contracts list
                     prev_contracts = contracts
@@ -340,7 +336,7 @@ class Blotter:
                 await asyncio.sleep(1)
                 
             except Exception as e:
-                self.logger.error(f"Error watching symbols file: {e}")
+                self._logger.error(f"Error watching symbols file: {e}")
                 await asyncio.sleep(1)
     
     # ---------------------------------------
@@ -362,7 +358,6 @@ class Blotter:
 
         Connects to the TWS/GW and sets up the IB connection.
         """
-        self.logger.info("Connecting to Interactive Brokers...")
         
         # Set callback
         self.ibConn.callback = self.ibCallback
@@ -371,13 +366,19 @@ class Blotter:
             # Check for unique blotter instance
             await self._check_unique_blotter()
             
+            self._logger.info("Connecting to Interactive Brokers...")
             # Connect to IB
-            await self.ibConn.connectAsync(
-                host=self.args['ibhost'],
-                port=self.args['ibport'],
-                clientId=self.args['ibclient']
-            )
-            self.logger.info(f"Connection established to IB at {self.args['ibhost']}:{self.args['ibport']}")
+            while not self.ibConn.isConnected:
+                await self.ibConn.connectAsync(
+                    ibhost=self.args['ibhost'],
+                    ibport=self.args['ibport'],
+                    ibclient=self.args['ibclient']
+                )
+                await asyncio.sleep(2)
+
+                if not self.ibConn.isConnected:
+                    print('*', end="", flush=True)
+            self._logger.info(f"Connection established to IB at {self.args['ibhost']}:{self.args['ibport']}")
 
             # Start watching symbols file
             asyncio.create_task(self._watch_symbols_file())
@@ -397,7 +398,7 @@ class Blotter:
             # This is expected when Ctrl+C is pressed
             pass
         except Exception as e:
-            self.logger.error(f"Error: {e}")
+            self._logger.error(f"Error: {e}")
         finally:
             # Cleanup
             await self._cleanup()
@@ -417,8 +418,8 @@ class Blotter:
         """Clean up resources."""
         # Disconnect from IB
         if self.ibConn.isConnected:
-            await self.ibConn.disconnect()
-            self.logger.info("Disconnected from IB")
+            self.ibConn.disconnect()
+            self._logger.info("Disconnected from IB")
             
         # Remove cached args file
         await self._remove_cached_args()

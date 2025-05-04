@@ -1,6 +1,8 @@
+import asyncio
 import argparse
 import hashlib
 import datetime
+import logging
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,6 +60,8 @@ class Reports:
         # return
         self._password = password if password is not None else hashlib.sha1(
             str(datetime.datetime.now().date()).encode('utf-8')).hexdigest()[:8]
+
+        self._logger = logging.getLogger('quant_async.reports')
     
     # ---------------------------------------
     def setup_app(self):
@@ -156,20 +160,28 @@ class Reports:
         async def _lifespan(app: FastAPI):
             # Startup: Connect to IB when FastAPI starts
             try:
-                await self.ibConn.connectAsync(
-                    self.args['ibhost'], self.args['ibport'], clientId=self.args['ibclient'])
-                print(f"Connected to IB at {self.ibhost}:{self.ibport}")
+                self._logger.info("Connecting to Interactive Brokers...")
+                while not self.ibConn.isConnected:
+                    await self.ibConn.connectAsync(
+                        ibhost=self.args['ibhost'], ibport=self.args['ibport'], ibclient=self.args['ibclient'])
+
+                    await asyncio.sleep(2)
+
+                    if not self.ibConn.isConnected:
+                        print('*', end="", flush=True)
+
+                self._logger.info(f"Connected to IB at {self.ibhost}:{self.ibport}")
             except Exception as e:
-                print(f"Error connecting to IB: {e}")
+                self._logger.error(f"Error connecting to IB: {e}")
             
             yield
             
             # Shutdown: Disconnect from IB when FastAPI shuts down
             try:
                 await self.ibConn.disconnect()
-                print("Disconnected from IB")
+                self._logger.info("Disconnected from IB")
             except Exception as e:
-                print(f"Error disconnecting from IB: {e}")
+                self._logger.error(f"Error disconnecting from IB: {e}")
         
         return _lifespan
 
