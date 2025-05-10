@@ -64,7 +64,7 @@ class Blotter:
         self.duplicate_run = False
         
         # Initialize IB connection
-        self.ibConn = ezIBAsync()
+        self.ezib = ezIBAsync()
     
     # ---------------------------------------
     @staticmethod
@@ -229,10 +229,10 @@ class Blotter:
                         if prev_contracts:
                             self._logger.info('Empty symbols file, canceling all market data...')
                             for contract in prev_contracts:
-                                contract_obj = self.ibConn.createContract(*contract)
-                                await self.ibConn.cancelMarketData(contract_obj)
+                                contract_obj = self.ezib.createContract(*contract)
+                                await self.ezib.cancelMarketData(contract_obj)
                                 if self.orderbook:
-                                    await self.ibConn.cancelMarketDepth(contract_obj)
+                                    await self.ezib.cancelMarketDepth(contract_obj)
                             prev_contracts = []
                         await asyncio.sleep(1)
                         continue
@@ -295,10 +295,10 @@ class Blotter:
                         first_run = False
                         # Request market data for all contracts on first run
                         for contract in contracts:
-                            contract_obj = self.ibConn.createContract(*contract)
-                            await self.ibConn.requestMarketData(contract_obj)
+                            contract_obj = self.ezib.createContract(*contract)
+                            await self.ezib.requestMarketData(contract_obj)
                             if self.orderbook:
-                                await self.ibConn.requestMarketDepth(contract_obj)
+                                await self.ezib.requestMarketDepth(contract_obj)
                             
                             # Log the addition
                             contract_string = str(contract[0])  # Use symbol as identifier
@@ -308,10 +308,10 @@ class Blotter:
                         if contracts != prev_contracts:
                             for contract in prev_contracts:
                                 if contract not in contracts:
-                                    contract_obj = self.ibConn.createContract(*contract)
-                                    await self.ibConn.cancelMarketData(contract_obj)
+                                    contract_obj = self.ezib.createContract(*contract)
+                                    await self.ezib.cancelMarketData(contract_obj)
                                     if self.orderbook:
-                                        await self.ibConn.cancelMarketDepth(contract_obj)
+                                        await self.ezib.cancelMarketDepth(contract_obj)
                                     
                                     # Log the removal
                                     contract_string = str(contract[0])  # Use symbol as identifier
@@ -320,10 +320,10 @@ class Blotter:
                             # Request market data for new contracts
                             for contract in contracts:
                                 if contract not in prev_contracts:
-                                    contract_obj = self.ibConn.createContract(*contract)
-                                    await self.ibConn.requestMarketData(contract_obj)
+                                    contract_obj = self.ezib.createContract(*contract)
+                                    await self.ezib.requestMarketData(contract_obj)
                                     if self.orderbook:
-                                        await self.ibConn.requestMarketDepth(contract_obj)
+                                        await self.ezib.requestMarketDepth(contract_obj)
                                     
                                     # Log the addition
                                     contract_string = str(contract[0])  # Use symbol as identifier
@@ -360,7 +360,7 @@ class Blotter:
         """
         
         # Set callback
-        self.ibConn.callback = self.ibCallback
+        self.ezib.callback = self.ibCallback
         
         try:
             # Check for unique blotter instance
@@ -368,15 +368,15 @@ class Blotter:
             
             self._logger.info("Connecting to Interactive Brokers...")
             # Connect to IB
-            while not self.ibConn.isConnected:
-                await self.ibConn.connectAsync(
+            while not self.ezib.isConnected:
+                await self.ezib.connectAsync(
                     ibhost=self.args['ibhost'],
                     ibport=self.args['ibport'],
                     ibclient=self.args['ibclient']
                 )
                 await asyncio.sleep(2)
 
-                if not self.ibConn.isConnected:
+                if not self.ezib.isConnected:
                     print('*', end="", flush=True)
             self._logger.info(f"Connection established to IB at {self.args['ibhost']}:{self.args['ibport']}")
 
@@ -417,8 +417,8 @@ class Blotter:
     async def _cleanup(self):
         """Clean up resources."""
         # Disconnect from IB
-        if self.ibConn.isConnected:
-            self.ibConn.disconnect()
+        if self.ezib.isConnected:
+            self.ezib.disconnect()
             self._logger.info("Disconnected from IB")
             
         # Remove cached args file

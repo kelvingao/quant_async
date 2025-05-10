@@ -4,7 +4,7 @@ import hashlib
 import datetime
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -37,7 +37,7 @@ class Reports:
         """
 
         # initialize the Interactive Brokers client
-        self.ibConn = ezIBAsync()
+        self.ezib = ezIBAsync()
         self.app = None
         
         # IB connection parameters
@@ -118,6 +118,45 @@ class Reports:
         async def dashboard_route(request: Request):
             # Your dashboard implementation
             return self.templates.TemplateResponse('dashboard.html', {"request": request})
+
+        @self.app.get("/accounts")
+        async def accounts_route():
+            """Get all IB account codes"""
+            try:
+                # Get account values from IB
+                accounts = list(self.ezib.accounts.keys())
+                return {"accounts": accounts}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error getting accounts info: {e}")
+
+        @self.app.get("/account/{account_id}")
+        @self.app.get("/account")
+        def account_route(account_id = None):
+            """Get detailed info for specific account"""
+            try:
+                if account_id is None:
+                    # Default to first account if none specified
+                    account_id = next(iter(self.ezib.accounts.keys()), None)
+                    if account_id is None:
+                        raise HTTPException(status_code=404, detail="No accounts found")
+                
+                # Get account details from IB
+                account_data = self.ezib.accounts.get(account_id)
+                if account_data is None:
+                    raise HTTPException(status_code=404, detail="Account not found")
+                    
+                # Format data for frontend template
+                return {
+                    "dailyPnL": float(account_data.get("NetLiquidation", 0)) - float(account_data.get("PreviousDayEquityWithLoanValue", 0)),
+                    "unrealizedPnL": float(account_data.get("UnrealizedPnL", 0)),
+                    "realizedPnL": float(account_data.get("RealizedPnL", 0)),
+                    "netLiquidity": float(account_data.get("NetLiquidation", 0)),
+                    "excessLiquidity": float(account_data.get("ExcessLiquidity", 0)),
+                    "maintMargin": float(account_data.get("MaintMarginReq", 0)),
+                    "sma": float(account_data.get("SMA", 0))
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error getting account details: {e}")
     
     # ---------------------------------------
     def load_cli_args(self):
@@ -161,13 +200,13 @@ class Reports:
             # Startup: Connect to IB when FastAPI starts
             try:
                 self._logger.info("Connecting to Interactive Brokers...")
-                while not self.ibConn.isConnected:
-                    await self.ibConn.connectAsync(
+                while not self.ezib.isConnected:
+                    await self.ezib.connectAsync(
                         ibhost=self.args['ibhost'], ibport=self.args['ibport'], ibclient=self.args['ibclient'])
 
                     await asyncio.sleep(2)
 
-                    if not self.ibConn.isConnected:
+                    if not self.ezib.isConnected:
                         print('*', end="", flush=True)
 
                 self._logger.info(f"Connected to IB at {self.ibhost}:{self.ibport}")
@@ -178,7 +217,7 @@ class Reports:
             
             # Shutdown: Disconnect from IB when FastAPI shuts down
             try:
-                await self.ibConn.disconnect()
+                await self.ezib.disconnect()
                 self._logger.info("Disconnected from IB")
             except Exception as e:
                 self._logger.error(f"Error disconnecting from IB: {e}")
@@ -186,7 +225,7 @@ class Reports:
         return _lifespan
 
     # ---------------------------------------
-    def run(self, host="0.0.0.0", port=8000):
+    def run(self, host="0.0.0.0", port=8000, reload=False, reload_dirs=["src"]):
         """
         Run the FastAPI application.
         
@@ -205,4 +244,4 @@ class Reports:
             print(" * Web app password is:", self._password)
             
         # Run the app
-        uvicorn.run(self.app, host=host, port=port)
+        uvicorn.run(self.app, host=host, port=port, reload=reload, reload_dirs=reload_dirs)
