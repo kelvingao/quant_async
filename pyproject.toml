@@ -10,5 +10,14 @@ dependencies = [
     "asyncpg>=0.30.0",
     "fastapi>=0.115.12",
     "jinja2>=3.1.6",
+    "psycopg2>=2.9.10",
     "uvicorn>=0.30.0",
+]
+
+[tool.setuptools]
+packages = ["quant_async"]
+
+[dependency-groups]
+dev = [
+    "alembic>=1.15.2",
 ]
