@@ -7,15 +7,21 @@ name = "quant-async"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "ezib_async>=0.1.0",
+    "aiozmq>=1.0.0",
     "asyncpg>=0.30.0",
+    "beautifulsoup4>=4.13.4",
     "fastapi>=0.115.12",
     "jinja2>=3.1.6",
+    "msgspec>=0.19.0",
     "psycopg2>=2.9.10",
+    "requests>=2.32.3",
     "uvicorn>=0.30.0",
 ]
 
 [tool.setuptools]
 packages = ["quant_async"]
+package-dir = {"" = "src"}
 
 [dependency-groups]
 dev = [
