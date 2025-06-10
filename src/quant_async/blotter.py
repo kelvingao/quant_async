@@ -1,3 +1,29 @@
+"""
+MIT License
+
+Copyright (c) 2025 Kelvin Gao
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+import os
+import sys
 import signal
 import argparse
 import asyncio
@@ -33,8 +59,8 @@ class Blotter:
         **kwargs: Additional keyword arguments.
     """
 
-    def __init__(self, ibhost="localhost", ibport=4001, ibclient=999, name=None, 
-                 symbols="symbols.csv", orderbook=False, **kwargs):
+    def __init__(self, ibhost="localhost", ibport=4001, ibclient=996, name=None, 
+                 symbols="symbols.csv", orderbook=False, zmqport="12345", zmqtopic=None,**kwargs):
         # Initialize class logger
         self._logger = logging.getLogger("quant_async.blotter")
         
@@ -423,7 +449,55 @@ class Blotter:
             
         # Remove cached args file
         await self._remove_cached_args()
-            
+
+# ===========================================
+#  Utility functions 
+# ===========================================
+def load_blotter_args(blotter_name=None, logger=None):
+    """ Load running blotter's settings (used by clients)
+
+    :Parameters:
+        blotter_name : str
+            Running Blotter's name (defaults to "auto-detect")
+        logger : object
+            Logger to be use (defaults to Blotter's)
+
+    :Returns:
+        args : dict
+            Running Blotter's arguments
+    """
+    # if logger is None:
+    #     logger = tools.createLogger(__name__, logging.WARNING)
+
+    # find specific name
+    if blotter_name is not None:  # and blotter_name != 'auto-detect':
+        args_cache_file = tempfile.gettempdir() + "/" + blotter_name.lower() + ".quant_async"
+        if not os.path.exists(args_cache_file):
+            logger.critical(
+                "Cannot connect to running Blotter [%s]", blotter_name)
+            if os.isatty(0):
+                sys.exit(0)
+            return []
+
+    # no name provided - connect to last running
+    else:
+        blotter_files = sorted(
+            glob.glob(tempfile.gettempdir() + "/*.quant_async"), key=os.path.getmtime)
+
+        if not blotter_files:
+            logger.critical(
+                "Cannot connect to running Blotter [%s]", blotter_name)
+            if os.isatty(0):
+                sys.exit(0)
+            return []
+
+        args_cache_file = blotter_files[-1]
+
+    args = pickle.load(open(args_cache_file, "rb"))
+    args['as_client'] = True
+
+    return args
+
 if __name__ == "__main__":
     blotter = Blotter()
     asyncio.run(blotter.run())
