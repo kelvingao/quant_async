@@ -25,23 +25,30 @@ SOFTWARE.
 import os
 import sys
 import signal
-import argparse
 import asyncio
 import logging
-import sys
-import os
 import tempfile
 import pickle
+import glob
+import argparse
 import pandas as pd
-from datetime import datetime
+import zmq
+import aiozmq
 
-# Import ezib_async
-from ezib_async import ezIBAsync
+from datetime import datetime
+from numpy import isnan
+from ezib_async.ezib import ezIBAsync
+from .objects import OrderBookSnapshot, DOMLevel
 
 path = {
     "library": os.path.dirname(os.path.realpath(__file__)),
     "caller": os.path.dirname(os.path.realpath(sys.argv[0]))
 }
+
+
+import msgspec
+from datetime import datetime
+
 
 class Blotter:
     """
@@ -68,11 +75,14 @@ class Blotter:
         self.name = str(self.__class__).split('.')[-1].split("'")[0].lower()
         if name is not None:
             self.name = name
-        
-        # IB connection parameters
-        self.ibhost = ibhost
-        self.ibport = ibport
-        self.ibclient = ibclient
+            
+        # -------------------------------
+        # work default values
+        # -------------------------------
+        if zmqtopic is None:
+            zmqtopic = "_quant_async_" + str(self.name.lower()) + "_"
+            
+        self.socket = None
         
         # Store arguments
         self.args = {arg: val for arg, val in locals().items()
@@ -88,9 +98,10 @@ class Blotter:
         
         # Flag to track if this is a duplicate run
         self.duplicate_run = False
-        
-        # Initialize IB connection
-        self.ezib = ezIBAsync()
+    
+    # ---------------------------------------
+    def _register_events_handler(self):
+        self.ezib.updateMarketDepthEvent += self.on_orderbook_received
     
     # ---------------------------------------
     @staticmethod
@@ -224,7 +235,6 @@ class Blotter:
         Watch the symbols file for changes and update subscriptions accordingly.
         Based on the original synchronous implementation but converted to async.
         """
-        self._logger.debug(f"Starting to watch symbols file: {self.symbols}")
         
         # Initialize tracking variables
         first_run = True
@@ -233,12 +243,12 @@ class Blotter:
         
         while True:
             try:
-                # Check if file exists
+                # no symbols file
                 if not os.path.exists(self.symbols):
                     self._logger.info(f"Creating symbols file: {self.symbols}")
-                    # Create empty symbols file with required columns
-                    df = pd.DataFrame(columns=['symbol', 'secType', 'exchange', 
-                                             'currency', 'expiry', 'strike', 'right'])
+                    # create empty symbols file
+                    df = pd.DataFrame(columns=['symbol', 'sec_type', 'exchange', 
+                                             'currency', 'expiry', 'strike', 'opt_type'])
                     df.to_csv(self.symbols, index=False)
                     os.chmod(self.symbols, 0o666)  # Make writable by all
                 else:
@@ -250,22 +260,22 @@ class Blotter:
                     db_size = db_data.st_size
                     db_last_modified = db_data.st_mtime
                     
-                    # Handle empty file
+                    # empty file
                     if db_size == 0:
                         if prev_contracts:
-                            self._logger.info('Empty symbols file, canceling all market data...')
+                            self._logger.info('Cancel market data...')
                             for contract in prev_contracts:
-                                contract_obj = self.ezib.createContract(*contract)
-                                await self.ezib.cancelMarketData(contract_obj)
+                                contract_obj = await self.ezib.createContract(*contract)
+                                self.ezib.cancelMarketData(contract_obj)
                                 if self.orderbook:
-                                    await self.ezib.cancelMarketDepth(contract_obj)
+                                    self.ezib.cancelMarketDepth(contract_obj)
                             prev_contracts = []
-                        await asyncio.sleep(1)
+                        # await asyncio.sleep(1)
                         continue
                     
-                    # Check if file was modified
+                    # file not modified
                     if not first_run and db_last_modified == db_modified:
-                        await asyncio.sleep(1)
+                        # await asyncio.sleep(0.1)
                         continue
                     
                     # Update modification time
@@ -274,38 +284,32 @@ class Blotter:
                     # Read symbols file
                     df = pd.read_csv(self.symbols)
                     if df.empty:
-                        await asyncio.sleep(1)
+                        # await asyncio.sleep(0.1)
                         continue
                     
-                    # Process the data
-                    
-                    # Remove expired contracts
-                    current_month = int(datetime.now().strftime('%Y%m'))
-                    current_day = int(datetime.now().strftime('%Y%m%d'))
-                    
                     # Filter based on expiry dates
-                    if 'expiry' in df.columns:
-                        # Convert expiry to numeric for comparison
-                        df['expiry'] = pd.to_numeric(df['expiry'], errors='coerce')
-                        
-                        # Filter out expired contracts
-                        mask = (
-                            pd.isna(df['expiry']) |  # Keep contracts with no expiry
-                            ((df['expiry'] < 1000000) & (df['expiry'] >= current_month)) |  # YYYYMM format
-                            ((df['expiry'] >= 1000000) & (df['expiry'] >= current_day))  # YYYYMMDD format
-                        )
-                        df = df[mask]
-                        
-                        # Convert expiry back to string format
-                        df['expiry'] = df['expiry'].fillna(0).astype(int).astype(str)
-                        df.loc[df['expiry'] == "0", 'expiry'] = ""
+                    current_date = datetime.now()
+                    df = df[(
+                        (df['expiry'] < 1000000) & 
+                        (df['expiry'] >= int(current_date.strftime('%Y%m'))) # current month
+                    ) | (
+                        (df['expiry'] >= 1000000) & 
+                        (df['expiry'] >= int(current_date.strftime('%Y%m%d'))) # current day
+                    ) | isnan(df['expiry'])]
                     
-                    # Filter out BAG security types
-                    if 'secType' in df.columns:
-                        df = df[df['secType'] != 'BAG']
+                    # 格式化数据
+                    df['expiry'] = df['expiry'].fillna(0).astype(int).astype(str)
+                    df.loc[df['expiry'] == "0", 'expiry'] = ""
+                    df = df[df['sec_type'] != 'BAG']
+                    df['opt_type'] = df['opt_type'].fillna("").astype(str)
+                    df['exchange'] = df['exchange'].fillna("").astype(str)
+                    df['currency'] = df['currency'].fillna("").astype(str)
                     
-                    # Fill NaN values
-                    df.fillna("", inplace=True)
+                    for col in df.columns:
+                        if df[col].dtype == 'object':
+                            df.fillna({col: ''}, inplace=True)
+                        else:
+                            df.fillna({col: 0}, inplace=True)
                     
                     # Save cleaned data back to file
                     df.to_csv(self.symbols, index=False)
@@ -319,41 +323,31 @@ class Blotter:
                     
                     if first_run:
                         first_run = False
-                        # Request market data for all contracts on first run
-                        for contract in contracts:
-                            contract_obj = self.ezib.createContract(*contract)
-                            await self.ezib.requestMarketData(contract_obj)
-                            if self.orderbook:
-                                await self.ezib.requestMarketDepth(contract_obj)
-                            
-                            # Log the addition
-                            contract_string = str(contract[0])  # Use symbol as identifier
-                            self._logger.info(f'Contract Added [{contract_string}]')
                     else:
-                        # Cancel market data for removed contracts
-                        if contracts != prev_contracts:
-                            for contract in prev_contracts:
-                                if contract not in contracts:
-                                    contract_obj = self.ezib.createContract(*contract)
-                                    await self.ezib.cancelMarketData(contract_obj)
-                                    if self.orderbook:
-                                        await self.ezib.cancelMarketDepth(contract_obj)
-                                    
-                                    # Log the removal
-                                    contract_string = str(contract[0])  # Use symbol as identifier
-                                    self._logger.info(f'Contract Removed [{contract_string}]')
-                    
-                            # Request market data for new contracts
-                            for contract in contracts:
-                                if contract not in prev_contracts:
-                                    contract_obj = self.ezib.createContract(*contract)
-                                    await self.ezib.requestMarketData(contract_obj)
-                                    if self.orderbook:
-                                        await self.ezib.requestMarketDepth(contract_obj)
-                                    
-                                    # Log the addition
-                                    contract_string = str(contract[0])  # Use symbol as identifier
-                                    self._logger.info(f'Contract Added [{contract_string}]')
+                        # symbols file changed
+                        for contract in prev_contracts:
+                            if contract not in contracts:
+
+                                contract_obj = await self.ezib.createContract(*contract)
+                                if contract_obj:
+                                    self.ezib.cancelMarketData(contract_obj)
+                                    if self.args['orderbook']:
+                                        self.ezib.cancelMarketDepth(contract_obj)
+                                    contract_string = self.ezib.contractString(contract).split('_')[0]
+                                    self._logger.info('Contract Removed [%s]', contract_string)
+                                
+                    # new contract
+                    for contract in contracts:
+                        if contract not in prev_contracts:
+
+                            contract_obj = await self.ezib.createContract(*contract)
+                            if contract_obj:
+                                await self.ezib.requestMarketData(contract_obj)
+                                if self.args['orderbook']:
+                                    self.ezib.requestMarketDepth(contract_obj)
+
+                                contract_string = self.ezib.contractString(contract).split('_')[0]
+                                self._logger.info('Contract Added [%s]', contract_string)
                     
                     # Update previous contracts list
                     prev_contracts = contracts
@@ -366,16 +360,133 @@ class Blotter:
                 await asyncio.sleep(1)
     
     # ---------------------------------------
-    async def ibCallback(self, caller, msg, **kwargs):
+    async def broadcast(self, ticker_snap, kind):
         """
-        Callback for Interactive Brokers events.
+        Broadcast market data using ZeroMQ.
+        
+        This method serializes the data and sends it over ZeroMQ with the appropriate topic.
         
         Args:
-            caller (str): Caller name.
-            msg: Message object.
-            **kwargs: Additional keyword arguments.
+            data (dict): The data to broadcast
+            kind (str): The kind of data (e.g., "TICK", "BAR", "QUOTE", "ORDERBOOK")
         """
-        pass
+        if self.socket is None:
+            self._logger.error(f"There is no socket connection setup")
+            return
+        
+        # ticker = TickerSnapshot(
+        #     symbol=data.contract.symbol,
+        #     timestamp = data.datetime.isoformat(),
+        #     bid=data.bid,
+        #     ask=data.ask,
+        #     kind=kind
+        # )
+        
+        serialized = msgspec.msgpack.encode(ticker_snap)
+    
+        # def datetime_handler(obj):
+        #     if isinstance(obj, datetime):
+        #         try:
+        #             # return datetime.strftime(o, ibDataTypes["DATE_TIME_FORMAT_LONG"])
+        #             return obj.isoformat()
+        #         except Exception as e:
+        #             self._logger.error(e)
+        #     raise TypeError
+        # string2send = f"{self.args['zmqtopic']} {json.dumps(data, default=datetime_handler)}"
+        try:  
+            self.socket.write([serialized])  # bytes needed
+            self._logger.debug(f"{ticker_snap} has been broadcasted...")
+        except (aiozmq.ZmqStreamClosed, ConnectionError) as e:
+            self._logger.error(f"Error broadcasting data via ZeroMQ: {e}")
+
+    # ---------------------------------------
+    async def on_orderbook_received(self, tickers):
+        for t in tickers:
+            # Extract bids and asks from the ticker
+            bids = []
+            asks = []
+            
+            # Process DOM bids if available
+            if hasattr(t, 'domBids') and t.domBids:
+                for bid in t.domBids:
+                    bids.append(DOMLevel(
+                        price=bid.price,
+                        size=bid.size,
+                        market_maker=bid.marketMaker if hasattr(bid, 'marketMaker') else ""
+                    ))
+            
+            # Process DOM asks if available
+            if hasattr(t, 'domAsks') and t.domAsks:
+                for ask in t.domAsks:
+                    asks.append(DOMLevel(
+                        price=ask.price,
+                        size=ask.size,
+                        market_maker=ask.marketMaker if hasattr(ask, 'marketMaker') else ""
+                    ))
+
+            # contractString = self.ezib.tickerSymbol(tickerId)
+            # Create the OrderBookSnapshot
+            try:
+                orderbook = OrderBookSnapshot(
+                    symbol="test",
+                    # symbol_group = tools.gen_symbol_group(contractString),
+                    # asset_class = tools.gen_asset_class(symbol),
+                    kind = "ORDERBOOK",
+
+                    bids=bids,
+                    asks=asks
+                )
+            except Exception as e:
+                self._logger.error(e)
+            
+            # Broadcast the orderbook
+            asyncio.create_task(self.broadcast(orderbook, "ORDERBOOK"))
+            self._logger(f"Orderbook: {orderbook} handled")
+    # ---------------------------------------
+    # async def on_orderbook_received(self, tickers):
+    #     for t in tickers:
+            
+    #         asyncio.create_task(self.broadcast(t, "ORDERBOOK"))
+            # print(t)
+        # orderbook = ticker
+        # print(orderbook.domBids)
+        
+        # TODO: add something
+        # orderbook.symbol = 
+        # symbol = self.ezib.tickerSymbol(tickerId)
+        # orderbook["symbol"] = symbol
+        # orderbook["symbol_group"] = tools.gen_symbol_group(symbol)
+        # orderbook["asset_class"] = tools.gen_asset_class(symbol)
+        # orderbook["kind"] = "ORDERBOOK"
+
+    # This method is implemented as async above
+
+    # -------------------------------------------
+    def register(self, instruments):
+        try:
+            if isinstance(instruments, dict):
+                instruments = list(instruments.values())
+
+            if not isinstance(instruments, list):
+                return
+
+            db = pd.read_csv(self.symbols, header=0).fillna("")
+
+            instruments = pd.DataFrame(instruments, columns=db.columns)
+            # instruments.columns = db.columns
+
+            # instruments['expiry'] = instruments['expiry'].astype(int).astype(str)
+            # db = db.append(instruments)
+            db = pd.concat([db, instruments], ignore_index=True)
+            # db['expiry'] = db['expiry'].astype(int)
+            key_columns = ['symbol', 'sec_type', 'exchange', 'currency', 'expiry']
+            db = db.drop_duplicates(subset=key_columns, keep="first")
+
+            db.to_csv(self.symbols, header=True, index=False)
+            os.chmod(self.symbols, 0o666)
+
+        except Exception as e:
+            self._logger.error(f"Instruments should be qualified before register: {e}")
 
     # ---------------------------------------        
     async def run(self):
@@ -385,26 +496,29 @@ class Blotter:
         Connects to the TWS/GW and sets up the IB connection.
         """
         
-        # Set callback
-        self.ezib.callback = self.ibCallback
-        
         try:
             # Check for unique blotter instance
             await self._check_unique_blotter()
             
-            self._logger.info("Connecting to Interactive Brokers...")
+            self.socket = await aiozmq.create_zmq_stream(zmq.PUB, bind="tcp://*:" + str(self.args['zmqport']))
+            self._logger.info(f"Broadcaster bound to: {list(self.socket.transport.bindings())}")
+            
+            self._logger.info(f"Connecting to Interactive Brokers at: {self.args['ibport']} (client: {self.args['ibclient']})")
+            # Initialize IB connection
+            self.ezib = ezIBAsync()
+            self._register_events_handler()
             # Connect to IB
-            while not self.ezib.isConnected:
+            while not self.ezib.connected:
                 await self.ezib.connectAsync(
-                    ibhost=self.args['ibhost'],
-                    ibport=self.args['ibport'],
-                    ibclient=self.args['ibclient']
+                    ibhost=str(self.args['ibhost']),
+                    ibport=int(self.args['ibport']),
+                    ibclient=int(self.args['ibclient'])
                 )
                 await asyncio.sleep(2)
 
-                if not self.ezib.isConnected:
+                if not self.ezib.connected:
                     print('*', end="", flush=True)
-            self._logger.info(f"Connection established to IB at {self.args['ibhost']}:{self.args['ibport']}")
+            self._logger.info(f"Connection established to IB")
 
             # Start watching symbols file
             asyncio.create_task(self._watch_symbols_file())
@@ -422,12 +536,136 @@ class Blotter:
 
         except asyncio.CancelledError:
             # This is expected when Ctrl+C is pressed
-            pass
+            if self.socket:
+                self.socket.close()
+                await self.socket.drain()
+            # pass
         except Exception as e:
             self._logger.error(f"Error: {e}")
         finally:
             # Cleanup
             await self._cleanup()
+    
+    async def stream(self, symbols, tick_handler=None, bar_handler=None,
+               quote_handler=None, book_handler=None, tz="UTC"):
+        """
+        Stream market data asynchronously using aiozmq.
+        
+        Args:
+            symbols (list or str): Symbols to subscribe to
+            tick_handler (callable, optional): Handler for tick data
+            bar_handler (callable, optional): Handler for bar data
+            quote_handler (callable, optional): Handler for quote data
+            book_handler (callable, optional): Handler for orderbook data
+            tz (str, optional): Timezone for datetime conversion. Defaults to "UTC".
+        """
+        # Load runtime/default data
+        if isinstance(symbols, str):
+            symbols = symbols.split(',')
+        symbols = list(map(str.strip, symbols))
+        
+        # Create ZMQ SUB socket
+        socket = await aiozmq.create_zmq_stream(
+            zmq.SUB, 
+            connect=f'tcp://127.0.0.1:{self.args["zmqport"]}'
+        )
+        
+        # Subscribe to all messages
+        socket.transport.setsockopt(zmq.SUBSCRIBE, b'')
+        
+        self._logger.info(f"Streaming data for symbols: {symbols}")
+        while True:
+            try:
+                # Wait for message
+                msg = await asyncio.wait_for(socket.read(), timeout=5)
+                data = msgspec.msgpack.decode(msg[0], type=OrderBookSnapshot)
+                # print(data)
+                
+                if data.kind == "ORDERBOOK":
+                    if book_handler is not None:
+                        asyncio.create_task(book_handler(data))
+                        continue
+                
+                # if self.args["zmqtopic"] in message:
+                #     message = message.split(self.args["zmqtopic"])[1].strip()
+                #     data = json.loads(message)
+                    
+                #     if data['symbol'] not in symbols:
+                #         continue
+                    
+                #     # Convert None to np.nan
+                #     for k, v in data.items():
+                #         if v is None:
+                #             data[k] = float('nan')
+                    
+                #     # Handle orderbook data
+                #     if data['kind'] == "ORDERBOOK":
+                #         print("orderbook data...")
+                #         if book_handler is not None:
+                #             asyncio.create_task(book_handler(data))
+                #             continue
+                    
+                #     # Handle quote data
+                #     if data['kind'] == "QUOTE":
+                #         if quote_handler is not None:
+                #             asyncio.create_task(quote_handler(data))
+                #             continue
+                    
+                #     # Process tick and bar data
+                #     try:
+                #         if 'timestamp' in data:
+                #             data["datetime"] = pd.to_datetime(data["timestamp"])
+                #         else:
+                #             data["datetime"] = pd.Timestamp.now(tz='UTC')
+                #     except Exception as e:
+                #         self._logger.error(f"Error parsing timestamp: {e}")
+                #         data["datetime"] = pd.Timestamp.now(tz='UTC')
+                    
+                #     # Create DataFrame
+                #     df = pd.DataFrame(index=[0], data=data)
+                #     df.set_index('datetime', inplace=True)
+                #     df.index = pd.to_datetime(df.index, utc=True)
+                    
+                #     # Drop unnecessary columns
+                #     if "timestamp" in df.columns:
+                #         df.drop("timestamp", axis=1, inplace=True)
+                #     if "kind" in df.columns:
+                #         df.drop("kind", axis=1, inplace=True)
+                    
+                #     # Convert timezone
+                #     try:
+                #         df.index = df.index.tz_convert(tz)
+                #     except Exception as e:
+                #         try:
+                #             df.index = df.index.tz_localize('UTC').tz_convert(tz)
+                #         except Exception as e:
+                #             self._logger.error(f"Error converting timezone: {e}")
+                    
+                #     # Handle tick data
+                #     if data['kind'] == "TICK":
+                #         if tick_handler is not None:
+                #             tick_handler(df)
+                    
+                #     # Handle bar data
+                #     elif data['kind'] == "BAR":
+                #         if bar_handler is not None:
+                #             bar_handler(df)
+            
+            except asyncio.CancelledError:
+                self._logger.info("Stream task cancelled")
+                socket.close()
+                await socket.drain()
+                raise
+            except asyncio.TimeoutError:
+                continue
+            
+            except Exception as e:
+                self._logger.error(f"Error in stream: {e}")
+                if socket:
+                    socket.close()
+                    await socket.drain()
+                raise
+
     
     # ---------------------------------------
     async def _shutdown(self):
@@ -442,10 +680,16 @@ class Blotter:
     # ---------------------------------------
     async def _cleanup(self):
         """Clean up resources."""
+        # Clean up ZMQ socket
+        # if self.socket:
+        #     await self.socket.close()
+        #     self.socket = None
+        
         # Disconnect from IB
-        if self.ezib.isConnected:
+        if self.ezib.connected:
+            # self.ezib.cancelMarketData()
             self.ezib.disconnect()
-            self._logger.info("Disconnected from IB")
+            self._logger.info("Dconnected from IB")
             
         # Remove cached args file
         await self._remove_cached_args()
