@@ -3,14 +3,20 @@ import argparse
 import hashlib
 import datetime
 import logging
+import asyncpg
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 from contextlib import asynccontextmanager
+
+from quant_async import tools
+from quant_async.blotter import (
+    Blotter, load_blotter_args
+)
 
 # Initialize the Interactive Brokers client
 from ezib_async import ezIBAsync
@@ -18,8 +24,9 @@ from ezib_async import ezIBAsync
 
 class Reports:
     
-    def __init__(self, ibhost='127.0.0.1', ibport=4001, ibclient=0, 
-                 static_dir=None, templates_dir=None, password=None, **kwargs):
+    def __init__(self, blotter=None, host='127.0.0.1', port=5002,
+                ibhost='127.0.0.1', ibport=4001, ibclient=10, 
+                static_dir=None, templates_dir=None, password=None, **kwargs):
         """
         Initialize the Reports class.
         
@@ -50,6 +57,16 @@ class Reports:
                     if arg not in ('__class__', 'self', 'kwargs')}
         self.args.update(kwargs)
         self.args.update(self.load_cli_args())
+
+        self.pool = None
+
+        self.host = self.args['host'] if self.args['host'] is not None else host
+        self.port = self.args['port'] if self.args['port'] is not None else port
+
+        # blotter / db connection
+        self.blotter_name = self.args['blotter'] if self.args['blotter'] is not None else blotter
+        self.blotter_args = load_blotter_args(self.blotter_name)
+        self.blotter = Blotter(**self.blotter_args)
         
         # web application directories
         self.static_dir = (Path(static_dir)
@@ -119,6 +136,22 @@ class Reports:
             # Your dashboard implementation
             return self.templates.TemplateResponse('dashboard.html', {"request": request})
 
+        @self.app.get("/algos")
+        async def algos():
+            """
+            Get all unique algos
+            """
+            try:
+                async with self.pool.acquire() as conn:
+                    records = await conn.fetch("SELECT DISTINCT algo FROM trades")
+                    return records
+            except asyncpg.PostgresError as e:
+                # 在实际应用中应记录日志
+                self._logger.error(f"Database error: {e}")
+                return []
+
+
+
         @self.app.get("/accounts")
         async def accounts_route():
             """Get all IB account codes"""
@@ -129,6 +162,156 @@ class Reports:
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error getting accounts info: {e}")
 
+        @self.app.get("/trades/{start}/{end}")
+        @self.app.get("/trades/{start}")
+        @self.app.get("/trades")
+        async def trades_route(start=None, end=None, algo_id=None, json=True):
+            # 清理输入参数
+            if algo_id is not None:
+                algo_id = algo_id.replace('/', '')
+            
+            # 设置默认开始时间（7天前）
+            if start is None:
+                start = tools.backdate("7D", date=None, as_datetime=True)
+            
+            # 构建基础查询
+            base_query = """
+                SELECT * 
+                FROM trades 
+                WHERE exit_time IS NOT NULL
+            """
+            conditions = []
+            params = []
+            param_count = 1
+            
+            # 添加时间条件
+            if start is not None:
+                conditions.append(f"entry_time >= ${param_count}")
+                params.append(start)
+                param_count += 1
+            
+            if end is not None:
+                conditions.append(f"exit_time <= ${param_count}")
+                params.append(end)
+                param_count += 1
+            
+            # 添加算法ID条件
+            if algo_id is not None:
+                conditions.append(f"algo = ${param_count}")
+                params.append(algo_id)
+                param_count += 1
+            
+            # 组合完整查询
+            if conditions:
+                base_query += " AND " + " AND ".join(conditions)
+            
+            # 添加排序
+            base_query += " ORDER BY exit_time DESC, entry_time DESC"
+            
+            try:
+                async with self.pool.acquire() as conn:
+                    # 执行查询
+                    records = await conn.fetch(base_query, *params)
+                    
+                    # 处理每条交易记录
+                    processed_trades = []
+                    for record in records:
+                        trade = dict(record)
+                        
+                        # 计算滑点
+                        slippage = abs(trade['entry_price'] - trade['market_price'])
+                        
+                        # 根据方向调整滑点正负
+                        if ((trade['direction'] == "LONG" and trade['entry_price'] > trade['market_price']) or
+                            (trade['direction'] == "SHORT" and trade['entry_price'] < trade['market_price'])):
+                            slippage = -slippage
+                        
+                        trade['slippage'] = slippage
+                        processed_trades.append(trade)
+                    
+                    return processed_trades
+            
+            except asyncpg.PostgresError as e:
+                self._logger.error(f"Database error in trades query: {str(e)}")
+                return []
+
+        @self.app.get("/positions/{algo_id}")
+        @self.app.get("/positions")
+        async def positions_route(algo_id=None, json=True):
+            """
+            Get all IB positions
+            """
+            if algo_id is not None:
+                algo_id = algo_id.replace('/', '')
+
+            trades_query = "SELECT * FROM trades WHERE exit_time IS NULL"
+            
+            params = []
+            
+            if algo_id is not None:
+                trades_query += " AND algo='" + algo_id + "'"
+
+            # 获取最新价格查询
+            last_price_query = """
+                SELECT s.id AS symbol_id, MAX(t.last) AS last_price
+                FROM ticks t
+                JOIN symbols s ON t.symbol_id = s.id
+                GROUP BY s.id
+            """
+
+            try:
+                processed_trades = []
+                async with self.pool.acquire() as conn:
+                    # 执行交易查询
+                    trades_records = await conn.fetch(trades_query, *params)
+                    
+                    # 执行最新价格查询
+                    last_prices = await conn.fetch(last_price_query)
+                    
+                    # 将最新价格转换为字典 {symbol_id: last_price}
+                    price_map = {record['symbol_id']: record['last_price'] for record in last_prices}
+                    
+                    # 处理交易记录
+                    for trade in trades_records:
+                        # 转换为字典
+                        trade_dict = dict(trade)
+                        
+                        # 获取该交易的最新价格
+                        last_price = price_map.get(trade_dict['symbol'])
+                        
+                        # 计算未实现盈亏
+                        if last_price is not None:
+                            if trade_dict['direction'] == "SHORT":
+                                unrealized_pnl = trade_dict['entry_price'] - last_price
+                            else:  # LONG
+                                unrealized_pnl = last_price - trade_dict['entry_price']
+                        else:
+                            unrealized_pnl = 0.0
+                        
+                        # 计算滑点
+                        slippage = abs(trade_dict['entry_price'] - trade_dict['market_price'])
+                        if ((trade_dict['direction'] == "LONG" and trade_dict['entry_price'] > trade_dict['market_price']) or
+                            (trade_dict['direction'] == "SHORT" and trade_dict['entry_price'] < trade_dict['market_price'])):
+                            slippage = -slippage
+                        
+                        # 添加计算字段
+                        trade_dict['last_price'] = last_price or 0.0
+                        trade_dict['unrealized_pnl'] = unrealized_pnl
+                        trade_dict['slippage'] = slippage
+                        
+                        processed_trades.append(trade_dict)
+                    
+                    # 按入场时间降序排序
+                    processed_trades.sort(key=lambda x: x['entry_time'], reverse=True)
+            
+            except asyncpg.PostgresError as e:
+                # 在实际应用中应记录日志
+                self._logger.error(f"Database error: {e}")
+                processed_trades = []
+
+            return processed_trades
+            
+        
         @self.app.get("/account/{account_id}")
         @self.app.get("/account")
         def account_route(account_id = None):
@@ -142,8 +325,11 @@ class Reports:
                 
                 # Get account details from IB
                 account_data = self.ezib.accounts.get(account_id)
+                # self._logger.info(account_data)
                 if account_data is None:
                     raise HTTPException(status_code=404, detail="Account not found")
+                
+                # account_value = {item.tag: item.value for item in account_data}
                     
                 # Format data for frontend template
                 return {
@@ -199,17 +385,30 @@ class Reports:
         async def _lifespan(app: FastAPI):
             # Startup: Connect to IB when FastAPI starts
             try:
-                self._logger.info("Connecting to Interactive Brokers...")
-                while not self.ezib.isConnected:
+                self._logger.info(f"Connecting to Interactive Brokers at: {self.args['ibport']} (client: {self.args['ibclient']})")
+                while not self.ezib.connected:
                     await self.ezib.connectAsync(
                         ibhost=self.args['ibhost'], ibport=self.args['ibport'], ibclient=self.args['ibclient'])
 
                     await asyncio.sleep(2)
 
-                    if not self.ezib.isConnected:
+                    if not self.ezib.connected:
                         print('*', end="", flush=True)
 
-                self._logger.info(f"Connected to IB at {self.ibhost}:{self.ibport}")
+                self._logger.info(f"Connected to IB at {self.ibhost}:{self.ibport} (clientId: {self.ibclient})")
+
+                # connect to postgres using blotter's settings
+                self.pool = await asyncpg.create_pool(
+                    host=str(self.blotter_args['dbhost']),
+                    port=int(self.blotter_args['dbport']),
+                    user=str(self.blotter_args['dbuser']),
+                    password=str(self.blotter_args['dbpass']),
+                    database=str(self.blotter_args['dbname']),
+                    min_size=5,
+                    max_size=20
+                )
+                if self.pool is None:
+                    raise HTTPException(status_code=500, detail="Database connection pool not initialized")
             except Exception as e:
                 self._logger.error(f"Error connecting to IB: {e}")
             
@@ -217,8 +416,12 @@ class Reports:
             
             # Shutdown: Disconnect from IB when FastAPI shuts down
             try:
-                await self.ezib.disconnect()
-                self._logger.info("Disconnected from IB")
+                self.ezib.disconnect()
+                self._logger.info("Dconnected from IB")
+
+                # close postgres connection pool
+                if self.pool:
+                    await self.pool.close()
             except Exception as e:
                 self._logger.error(f"Error disconnecting from IB: {e}")
         

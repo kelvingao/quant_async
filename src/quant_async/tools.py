@@ -1,4 +1,5 @@
 import datetime
+from datetime import timezone
 import time
 import os
 import sys
@@ -94,7 +95,7 @@ def to_decimal(number, points=None):
 
 def week_started_date(as_datetime=False):
 
-    today = datetime.datetime.utcnow()
+    today = datetime.datetime.now(timezone.utc)
     start = today - datetime.timedelta((today.weekday() + 1) % 7)
     dt = start + relativedelta.relativedelta(weekday=relativedelta.SU(-1))
 
@@ -143,7 +144,7 @@ def create_ib_tuple(instrument):
                               spec['exchange'].upper(), spec['currency'].upper(),
                               int(expiry), 0.0, "")
 
-            except Exception as e:
+            except Exception:
                 raise ValueError("Un-parsable contract tuple")
 
     # tuples without strike/right
@@ -162,7 +163,7 @@ def create_ib_tuple(instrument):
 
         try:
             instrument_list[4] = int(instrument_list[4])
-        except Exception as e:
+        except Exception:
             pass
 
         instrument_list[5] = 0. if isinstance(instrument_list[5], str) \
@@ -274,11 +275,11 @@ def chmod(f):
     """ change mod to writeable """
     try:
         os.chmod(f, S_IWRITE)  # windows (cover all)
-    except Exception as e:
+    except Exception:
         pass
     try:
         os.chmod(f, 0o777)  # *nix
-    except Exception as e:
+    except Exception:
         pass
 
 
@@ -298,7 +299,7 @@ def ib_duration_str(start_date=None):
     Get a datetime object or a epoch timestamp and return
     an IB-compatible durationStr for reqHistoricalData()
     """
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(timezone.utc)
 
     if is_number(start_date):
         diff = now - datetime.datetime.fromtimestamp(float(start_date))
@@ -361,7 +362,7 @@ def backdate(res, date=None, as_datetime=False, fmt='%Y-%m-%d'):
     else:
         try:
             date = parse_date(date)
-        except Exception as e:
+        except Exception:
             pass
 
     new_date = date
@@ -439,9 +440,9 @@ def get_timezone(as_timedelta=False):
     """ utility to get the machine's timezone """
     try:
         offset_hour = -(time.altzone if time.daylight else time.timezone)
-    except Exception as e:
+    except Exception:
         offset_hour = -(datetime.datetime.now() -
-                        datetime.datetime.utcnow()).seconds
+                        datetime.datetime.now(timezone.utc)).seconds
 
     offset_hour = offset_hour // 3600
     offset_hour = offset_hour if offset_hour < 10 else offset_hour // 10
@@ -487,13 +488,13 @@ def set_timezone(data, tz=None, from_local=False):
         try:
             try:
                 data.index = data.index.tz_convert(tz)
-            except Exception as e:
+            except Exception:
                 if from_local:
                     data.index = data.index.tz_localize(
                         get_timezone()).tz_convert(tz)
                 else:
                     data.index = data.index.tz_localize('UTC').tz_convert(tz)
-        except Exception as e:
+        except Exception:
             pass
 
     # not pandas...
@@ -503,9 +504,9 @@ def set_timezone(data, tz=None, from_local=False):
         try:
             try:
                 data = data.astimezone(tz)
-            except Exception as e:
+            except Exception:
                 data = timezone('UTC').localize(data).astimezone(timezone(tz))
-        except Exception as e:
+        except Exception:
             pass
 
     return data
@@ -561,13 +562,13 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
         # figure out timezone
         try:
             tz = data.index.tz if tz is None else tz
-        except Exception as e:
+        except Exception:
             pass
 
         if str(tz) != 'None':
             try:
                 data.index = data.index.tz_convert(tz)
-            except Exception as e:
+            except Exception:
                 data.index = data.index.tz_localize('UTC').tz_convert(tz)
 
         # sort by index (datetime)
@@ -602,7 +603,7 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
                        'opt_delta', 'opt_gamma', 'opt_theta', 'opt_vega']].copy()
             price_col = 'last'
             size_col = 'lastsize'
-        except Exception as e:
+        except Exception:
             df = data[['close', 'volume', 'opt_underlying', 'opt_price',
                        'opt_dividend', 'opt_volume', 'opt_iv', 'opt_oi',
                        'opt_delta', 'opt_gamma', 'opt_theta', 'opt_vega']].copy()
@@ -921,7 +922,7 @@ class DataStore():
                     recorded.columns.str.startswith(sym + '_OPT_')].tolist()
                 if len(opt_cols) == len(recorded[opt_cols].isnull().all()):
                     recorded.drop(opt_cols, axis=1, inplace=True)
-            except Exception as e:
+            except Exception:
                 pass
 
         # group df

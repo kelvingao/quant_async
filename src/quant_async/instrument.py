@@ -63,7 +63,7 @@ class Instrument(str):
             if attr is not None:
                 attr = attr.replace("quantity", "position")
             return pos[attr]
-        except Exception as e:
+        except Exception:
             return pos
 
     # ---------------------------------------

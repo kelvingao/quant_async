@@ -1,8 +1,6 @@
-import sys
 import asyncio
 import logging
 import argparse
-import signal
 import pandas as pd
 
 from abc import ABCMeta, abstractmethod

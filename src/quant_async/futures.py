@@ -1,8 +1,6 @@
 import datetime
 import os.path
 import pandas as pd
-import numpy as np
-import re
 import time
 import tempfile
 import sys
@@ -35,7 +33,7 @@ def create_continuous_contract(df, resolution="1T"):
         try:
             # rollver by date
             roll_date = m1['expiry'].unique()[-1]
-        except Exception as e:
+        except Exception:
             # rollover by volume
             combined = m1.merge(m2, left_index=True, right_index=True)
             m_highest = combined['volume_y'] > combined['volume_x']
@@ -69,7 +67,7 @@ def create_continuous_contract(df, resolution="1T"):
                 ]['expiry'][0]
                 gap = minidf[minidf['expiry'] == expiry]['diff'][0]
                 flags.loc[flags.index <= expiration, 'gap'] = gap
-            except Exception as e:
+            except Exception:
                 pass
 
         flags = flags[flags['symbol'].isin(flags['symbol'].unique())]
@@ -94,7 +92,7 @@ def create_continuous_contract(df, resolution="1T"):
     daily_df.sort_index(inplace=True)
     try:
         daily_df['diff'] = daily_df['close'].diff()
-    except Exception as e:
+    except Exception:
         daily_df['diff'] = daily_df['last'].diff()
 
     # build flags
@@ -124,7 +122,7 @@ def create_continuous_contract(df, resolution="1T"):
         contract['low'] = contract['low'] + contract['gap']
         contract['close'] = contract['close'] + contract['gap']
         # contract['volume'] = df['volume'].resample("D").sum()
-    except Exception as e:
+    except Exception:
         contract['last'] = contract['last'] + contract['gap']
 
     contract.drop(['gap'], axis=1, inplace=True)
@@ -167,7 +165,7 @@ def get_active_contract(symbol, url=None, n=1):
         # remove duplidates
         try:
             df = df.reset_index().drop_duplicates(keep='last')
-        except Exception as e:
+        except Exception:
             df = df.reset_index().drop_duplicates(take_last=True)
 
         return df[:13].dropna()
@@ -175,7 +173,7 @@ def get_active_contract(symbol, url=None, n=1):
     if url is None:
         try:
             url = _get_futures_url(symbol, 'quotes_settlements_futures')
-        except Exception as e:
+        except Exception:
             pass
 
     try:
@@ -190,7 +188,7 @@ def get_active_contract(symbol, url=None, n=1):
         else:
             # based on date
             return c[:1]['expiry'].values[0]
-    except Exception as e:
+    except Exception:
         if tools.after_third_friday():
             return (datetime.datetime.now() + (datetime.timedelta(365 / 12) * 2)
                     ).strftime('%Y%m')
@@ -201,7 +199,7 @@ def get_active_contract(symbol, url=None, n=1):
 
 # -------------------------------------------
 def make_tuple(symbol, expiry=None, exchange=None):
-    if expiry == None:
+    if expiry is None:
         expiry = get_active_contract(symbol)
 
     contract = get_ib_futures(symbol, exchange)
@@ -281,7 +279,7 @@ def get_ib_futures(symbol=None, exchange=None, ttl=86400):
         df['intraday_initial'].fillna(df['overnight_initial'], inplace=True)
         df['intraday_maintenance'].fillna(df['intraday_initial'], inplace=True)
 
-    except Exception as e:
+    except Exception:
         # fallback - download specs from qtpylib.io
         df = pd.read_csv('https://qtpylib.io/resources/futures_spec.csv.gz')
 
@@ -302,7 +300,7 @@ def _get_futures_url(symbol, page):
     try:
         return futures_contracts['base_url'] + \
             futures_contracts[symbol.upper()]['url'].replace('{}', page)
-    except Exception as e:
+    except Exception:
         return None
 
 

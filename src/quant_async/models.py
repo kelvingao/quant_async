@@ -1,10 +1,11 @@
+from typing import Any
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Date, DateTime, Numeric,
     ForeignKey, UniqueConstraint
 )
 from sqlalchemy.orm import declarative_base, relationship
 
-Base = declarative_base()
+Base: Any = declarative_base()
 
 class Version(Base):
     __tablename__ = '_version_'

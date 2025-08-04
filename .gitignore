@@ -10,3 +10,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Project files
+PRPs/
+notebooks/
+.claude/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
