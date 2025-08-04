@@ -1,0 +1,229 @@
+name: Release
+
+# NOTE: This workflow temporarily removes ezib-async local dependency during CI build
+# TODO: Consider publishing ezib-async to PyPI or using git submodules for better CI integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/quant_async/version.py'
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version increment type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  detect-version-change:
+    runs-on: ubuntu-latest
+    outputs:
+      version-changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          
+      - name: Check if version changed
+        id: check
+        run: |
+          if git diff HEAD~1 HEAD --name-only | grep -q "src/quant_async/version.py"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Get current version
+        id: get-version
+        run: |
+          VERSION=$(python -c "import sys; sys.path.insert(0, 'src'); from quant_async.version import __version__; print(__version__)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  create-release:
+    needs: detect-version-change
+    if: needs.detect-version-change.outputs.version-changed == 'true' && !contains(needs.detect-version-change.outputs.version, 'dev') && !contains(needs.detect-version-change.outputs.version, 'alpha') && !contains(needs.detect-version-change.outputs.version, 'beta')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          
+      - name: Install dependencies
+        run: |
+          # Temporarily remove local ezib-async dependency for CI build
+          uv remove ezib-async || true
+          uv sync --dev
+          uv add build twine
+          
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="${{ needs.detect-version-change.outputs.version }}"
+          echo "Generating changelog for version $VERSION"
+          
+          # Get commits since last tag
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --reverse)
+          else
+            COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"- %s (%h)" --reverse)
+          fi
+          
+          # Create changelog
+          cat > CHANGELOG.md << EOF
+          # Release v$VERSION
+          
+          ## Changes in this release:
+          
+          $COMMITS
+          
+          ## Full Changelog
+          
+          **Full Changelog**: https://github.com/\${{ github.repository }}/compare/\${LAST_TAG}...v$VERSION
+          EOF
+          
+          echo "changelog-file=CHANGELOG.md" >> $GITHUB_OUTPUT
+          
+      - name: Create Git Tag
+        run: |
+          VERSION="${{ needs.detect-version-change.outputs.version }}"
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+          
+      - name: Build package
+        run: |
+          uv build
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.detect-version-change.outputs.version }}
+          name: Release v${{ needs.detect-version-change.outputs.version }}
+          body_path: CHANGELOG.md
+          files: |
+            dist/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          twine upload dist/* --skip-existing
+
+  manual-release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          
+      - name: Install dependencies
+        run: |
+          # Temporarily remove local ezib-async dependency for CI build
+          uv remove ezib-async || true
+          uv sync --dev
+          uv add bump2version build twine
+          
+      - name: Configure git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+      - name: Bump version
+        run: |
+          bump2version ${{ github.event.inputs.version_type }} --verbose
+          
+      - name: Push changes
+        run: |
+          git push origin main --tags
+          
+      - name: Get new version
+        id: version
+        run: |
+          VERSION=$(python -c "import sys; sys.path.insert(0, 'src'); from quant_async.version import __version__; print(__version__)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+      - name: Generate changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --reverse HEAD~1)
+          else
+            COMMITS=$(git log ${LAST_TAG}..HEAD~1 --pretty=format:"- %s (%h)" --reverse)
+          fi
+          
+          cat > CHANGELOG.md << EOF
+          # Release v$VERSION
+          
+          ## Changes in this release:
+          
+          $COMMITS
+          
+          ## Full Changelog
+          
+          **Full Changelog**: https://github.com/\${{ github.repository }}/compare/\${LAST_TAG}...v$VERSION
+          EOF
+          
+      - name: Build package
+        run: |
+          uv build
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          body_path: CHANGELOG.md
+          files: |
+            dist/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          twine upload dist/* --skip-existing
