@@ -34,10 +34,18 @@ import argparse
 import pandas as pd
 import zmq
 import aiozmq
+import asyncpg
+import msgspec
+import pytz
 
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any
 from numpy import isnan
 from ezib_async.ezib import ezIBAsync
+from quant_async import tools
+from quant_async.monitoring import SystemMonitor
+# from quant_async.util import prepare_history  # TODO: Implement prepare_history
+
 from .objects import OrderBookSnapshot, DOMLevel
 
 path = {
@@ -46,8 +54,8 @@ path = {
 }
 
 
-import msgspec
-from datetime import datetime
+# cash ticks
+cash_ticks: dict[str, Any] = {}
 
 
 class Blotter:
@@ -67,7 +75,7 @@ class Blotter:
     """
 
     def __init__(self, ibhost="localhost", ibport=4001, ibclient=996, name=None, 
-                 symbols="symbols.csv", orderbook=False, zmqport="12345", zmqtopic=None,**kwargs):
+                 symbols="symbols.csv", orderbook=False, zmqport="12345", zmqtopic=None, dbskip=False, **kwargs):
         # Initialize class logger
         self._logger = logging.getLogger("quant_async.blotter")
         
@@ -82,7 +90,15 @@ class Blotter:
         if zmqtopic is None:
             zmqtopic = "_quant_async_" + str(self.name.lower()) + "_"
             
+        self.pool = None
         self.socket = None
+        self.stop_event = None
+        
+        # Initialize monitoring system
+        self.monitor = SystemMonitor()
+        
+        # Initialize symbol cache with monitoring
+        self.symbol_ids = {}
         
         # Store arguments
         self.args = {arg: val for arg, val in locals().items()
@@ -91,13 +107,22 @@ class Blotter:
         self.args.update(self.load_cli_args())
 
         # Symbols file and monitoring settings
-        self.symbols = path['caller'] + '/' + self.args['symbols']
+        if os.path.isabs(self.args['symbols']):
+            self.symbols = self.args['symbols']
+        else:
+            self.symbols = path['caller'] + '/' + self.args['symbols']
         
         # Initialize args cache file path
         self.args_cache_file = os.path.join(tempfile.gettempdir(), f"{self.name}.quant_async")
         
         # Flag to track if this is a duplicate run
         self.duplicate_run = False
+        
+        # Log initialization with configuration summary
+        self._logger.info(f"Initializing Blotter '{self.name}' with enhanced monitoring")
+        self._logger.info(f"Configuration - IB: {self.args['ibhost']}:{self.args['ibport']}[{self.args['ibclient']}], "
+                         f"DB: {'enabled' if not self.args['dbskip'] else 'disabled'}, "
+                         f"ZMQ: {self.args['zmqport']}, OrderBook: {self.args['orderbook']}")
     
     # ---------------------------------------
     def _register_events_handler(self):
@@ -367,37 +392,34 @@ class Blotter:
         This method serializes the data and sends it over ZeroMQ with the appropriate topic.
         
         Args:
-            data (dict): The data to broadcast
+            ticker_snap (dict): The data to broadcast
             kind (str): The kind of data (e.g., "TICK", "BAR", "QUOTE", "ORDERBOOK")
         """
         if self.socket is None:
-            self._logger.error(f"There is no socket connection setup")
+            self._logger.error("There is no socket connection setup")
+            self.monitor.record_error("zmq_socket_missing", "No ZeroMQ socket available")
             return
         
-        # ticker = TickerSnapshot(
-        #     symbol=data.contract.symbol,
-        #     timestamp = data.datetime.isoformat(),
-        #     bid=data.bid,
-        #     ask=data.ask,
-        #     kind=kind
-        # )
-        
-        serialized = msgspec.msgpack.encode(ticker_snap)
-    
-        # def datetime_handler(obj):
-        #     if isinstance(obj, datetime):
-        #         try:
-        #             # return datetime.strftime(o, ibDataTypes["DATE_TIME_FORMAT_LONG"])
-        #             return obj.isoformat()
-        #         except Exception as e:
-        #             self._logger.error(e)
-        #     raise TypeError
-        # string2send = f"{self.args['zmqtopic']} {json.dumps(data, default=datetime_handler)}"
-        try:  
-            self.socket.write([serialized])  # bytes needed
-            self._logger.debug(f"{ticker_snap} has been broadcasted...")
+        try:
+            # Record message for monitoring
+            symbol = ticker_snap.get('symbol', 'unknown') if isinstance(ticker_snap, dict) else 'unknown'
+            self.monitor.record_message(kind, symbol)
+            
+            # Serialize and broadcast
+            with self.monitor.time_operation(f"broadcast_{kind.lower()}"):
+                serialized = msgspec.msgpack.encode(ticker_snap)
+                self.socket.write([serialized])
+                
+            self._logger.debug(f"Broadcasted {kind} for {symbol}")
+            
         except (aiozmq.ZmqStreamClosed, ConnectionError) as e:
-            self._logger.error(f"Error broadcasting data via ZeroMQ: {e}")
+            error_msg = f"Error broadcasting {kind} data via ZeroMQ: {e}"
+            self._logger.error(error_msg)
+            self.monitor.record_error("zmq_broadcast_error", error_msg)
+        except Exception as e:
+            error_msg = f"Unexpected error in broadcast: {e}"
+            self._logger.error(error_msg)
+            self.monitor.record_error("broadcast_error", error_msg)
 
     # ---------------------------------------
     async def on_orderbook_received(self, tickers):
@@ -488,63 +510,232 @@ class Blotter:
         except Exception as e:
             self._logger.error(f"Instruments should be qualified before register: {e}")
 
+    # ---------------------------------------
+    async def get_postgres_connection(self):
+        """
+        Get PostgreSQL connection pool.
+        """
+        return await asyncpg.create_pool(
+            host=os.getenv('POSTGRES_HOST', 'localhost'),
+            port=int(os.getenv('POSTGRES_PORT', '5432')),
+            user=os.getenv('POSTGRES_USER', 'quant_async'),
+            password=os.getenv('POSTGRES_PASSWORD', 'quant_async'),
+            database=os.getenv('POSTGRES_DB', 'quant_async'),
+            min_size=2,
+            max_size=10
+        )
+    
+    async def postgres_connect(self):
+        """
+        Connect to PostgreSQL database.
+        """
+        if self.args['dbskip']:
+            return
+        
+        # create asyncpg connection pool
+        self.pool = await self.get_postgres_connection()
+    
+    async def _postgres_connect_with_monitoring(self):
+        """
+        Connect to PostgreSQL with monitoring and retry logic.
+        """
+        if self.args['dbskip']:
+            self._logger.info("Database connection skipped (dbskip=True)")
+            self.monitor.connection_monitor.health_checker.update_status(
+                "database", "degraded", "Database connection intentionally skipped"
+            )
+            return
+
+        if self.pool is not None:
+            return
+        
+        max_retries = 5
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                self._logger.info(f"Attempting database connection (attempt {attempt + 1}/{max_retries})")
+                
+                with self.monitor.time_operation("postgres_connect"):
+                    self.pool = await self.get_postgres_connection()
+                
+                # Test connection
+                if await self.monitor.connection_monitor.check_database_connection(self.pool):
+                    self._logger.info("Database connection established successfully")
+                    self.monitor.metrics_collector.update_connection_status("database", True)
+                    return
+                else:
+                    raise Exception("Database connection test failed")
+                    
+            except Exception as e:
+                error_msg = f"Database connection attempt {attempt + 1} failed: {e}"
+                self._logger.warning(error_msg)
+                self.monitor.record_error("database_connection_attempt", error_msg)
+                
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    self._logger.info(f"Retrying database connection in {delay:.1f} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    # Final attempt failed
+                    self._logger.error(f"Failed to connect to database after {max_retries} attempts")
+                    self.monitor.connection_monitor.health_checker.update_status(
+                        "database", "unhealthy", f"Connection failed after {max_retries} attempts"
+                    )
+                    # Continue without database (graceful degradation)
+                    self.args['dbskip'] = True
+                    self._logger.warning("Continuing in database-skip mode due to connection failures")
+
+    async def _setup_zmq_with_monitoring(self):
+        """
+        Setup ZeroMQ socket with monitoring and error handling.
+        """
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                self._logger.info(f"Setting up ZeroMQ socket (attempt {attempt + 1}/{max_retries})")
+                
+                with self.monitor.time_operation("zmq_setup"):
+                    self.socket = await aiozmq.create_zmq_stream(
+                        zmq.PUB, bind=f"tcp://*:{self.args['zmqport']}"
+                    )
+                
+                # Test socket
+                if await self.monitor.connection_monitor.check_zeromq_socket(self.socket):
+                    self._logger.info(f"ZeroMQ broadcaster bound to: {list(self.socket.transport.bindings())}")
+                    self.monitor.metrics_collector.update_connection_status("zeromq", True)
+                    return
+                else:
+                    raise Exception("ZeroMQ socket test failed")
+                    
+            except Exception as e:
+                error_msg = f"ZeroMQ setup attempt {attempt + 1} failed: {e}"
+                self._logger.warning(error_msg)
+                self.monitor.record_error("zmq_setup_attempt", error_msg)
+                
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    self._logger.info(f"Retrying ZeroMQ setup in {delay:.1f} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    # Final attempt failed - this is critical
+                    self._logger.error(f"Failed to setup ZeroMQ after {max_retries} attempts")
+                    self.monitor.connection_monitor.health_checker.update_status(
+                        "zeromq", "unhealthy", f"Setup failed after {max_retries} attempts"
+                    )
+                    raise Exception(f"ZeroMQ setup failed after {max_retries} attempts")
+    
+    async def _connect_ib_with_retry(self):
+        """
+        Connect to Interactive Brokers with enhanced retry logic and monitoring.
+        """
+        max_retries = 10
+        base_delay = 2.0
+        max_delay = 30.0
+        
+        self._logger.info(f"Connecting to Interactive Brokers at {self.args['ibhost']}:{self.args['ibport']} (client: {self.args['ibclient']})")
+        
+        # Initialize IB connection
+        self.ezib = ezIBAsync()
+        self._register_events_handler()
+        
+        for attempt in range(max_retries):
+            try:
+                self._logger.info(f"IB connection attempt {attempt + 1}/{max_retries}")
+                
+                with self.monitor.time_operation("ib_connect"):
+                    await self.ezib.connectAsync(
+                        ibhost=str(self.args['ibhost']),
+                        ibport=int(self.args['ibport']),
+                        ibclient=int(self.args['ibclient'])
+                    )
+                
+                # Check connection with monitoring
+                if await self.monitor.connection_monitor.check_ib_connection(self.ezib):
+                    self._logger.info("Interactive Brokers connection established successfully")
+                    self.monitor.metrics_collector.update_connection_status("ib", True)
+                    return
+                else:
+                    raise Exception("IB connection test failed")
+                    
+            except Exception as e:
+                error_msg = f"IB connection attempt {attempt + 1} failed: {e}"
+                self._logger.warning(error_msg)
+                self.monitor.record_error("ib_connection_attempt", error_msg)
+                
+                if attempt < max_retries - 1:
+                    # Exponential backoff with jitter and max delay
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    # Add jitter to prevent thundering herd
+                    import random
+                    jitter = random.uniform(0.8, 1.2)
+                    delay *= jitter
+                    
+                    self._logger.info(f"Retrying IB connection in {delay:.1f} seconds...")
+                    print('*', end="", flush=True)  # Keep original progress indicator
+                    await asyncio.sleep(delay)
+                else:
+                    # Final attempt failed - this is critical
+                    self._logger.error(f"Failed to connect to Interactive Brokers after {max_retries} attempts")
+                    self.monitor.connection_monitor.health_checker.update_status(
+                        "interactive_brokers", "unhealthy", f"Connection failed after {max_retries} attempts"
+                    )
+                    raise Exception(f"IB connection failed after {max_retries} attempts")
+
     # ---------------------------------------        
     async def run(self):
         """
-        Start the blotter.
+        Start the blotter with enhanced monitoring and error handling.
 
-        Connects to the TWS/GW and sets up the IB connection.
+        Connects to the TWS/GW and sets up the IB connection with retry logic,
+        monitoring, and graceful degradation.
         """
         
         try:
+            # Start monitoring system
+            await self.monitor.start_monitoring(self)
+            self._logger.info("System monitoring started")
+            
             # Check for unique blotter instance
             await self._check_unique_blotter()
-            
-            self.socket = await aiozmq.create_zmq_stream(zmq.PUB, bind="tcp://*:" + str(self.args['zmqport']))
-            self._logger.info(f"Broadcaster bound to: {list(self.socket.transport.bindings())}")
-            
-            self._logger.info(f"Connecting to Interactive Brokers at: {self.args['ibport']} (client: {self.args['ibclient']})")
-            # Initialize IB connection
-            self.ezib = ezIBAsync()
-            self._register_events_handler()
-            # Connect to IB
-            while not self.ezib.connected:
-                await self.ezib.connectAsync(
-                    ibhost=str(self.args['ibhost']),
-                    ibport=int(self.args['ibport']),
-                    ibclient=int(self.args['ibclient'])
-                )
-                await asyncio.sleep(2)
 
-                if not self.ezib.connected:
-                    print('*', end="", flush=True)
-            self._logger.info(f"Connection established to IB")
+            # Connect to postgres with monitoring
+            await self._postgres_connect_with_monitoring()
+            
+            # Setup ZeroMQ with monitoring
+            await self._setup_zmq_with_monitoring()
+            
+            # Connect to IB with enhanced retry logic
+            await self._connect_ib_with_retry()
 
             # Start watching symbols file
             asyncio.create_task(self._watch_symbols_file())
             
             # Create an event that will never be set
-            stop_event = asyncio.Event()
+            self.stop_event = asyncio.Event()
             
             # Setup signal handlers for graceful shutdown
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(self._shutdown()))
             
+            self._logger.info("Blotter fully operational - all systems ready")
+            
             # Wait for the event (which will never be set unless we call _shutdown)
-            await stop_event.wait()
+            await self.stop_event.wait()
 
         except asyncio.CancelledError:
-            # This is expected when Ctrl+C is pressed
-            if self.socket:
-                self.socket.close()
-                await self.socket.drain()
-            # pass
+            self._logger.info("Blotter cancelled - performing graceful shutdown")
         except Exception as e:
-            self._logger.error(f"Error: {e}")
+            error_msg = f"Critical error in blotter run: {e}"
+            self._logger.error(error_msg)
+            self.monitor.record_error("blotter_run_error", error_msg)
+            raise
         finally:
-            # Cleanup
-            await self._cleanup()
+            # Cleanup with monitoring
+            await self._cleanup_with_monitoring()
     
     async def stream(self, symbols, tick_handler=None, bar_handler=None,
                quote_handler=None, book_handler=None, tz="UTC"):
@@ -669,13 +860,45 @@ class Blotter:
     
     # ---------------------------------------
     async def _shutdown(self):
-        """Handle graceful shutdown."""
-        print(
-                "\n\n>>> Interrupted with Ctrl-c...\n(waiting for running tasks to be completed)\n")
-        # Cancel all running tasks except the current one
-        for task in asyncio.all_tasks():
-            if task is not asyncio.current_task():
-                task.cancel()
+        """Handle graceful shutdown with enhanced monitoring."""
+        self._logger.info("Shutdown signal received - initiating graceful shutdown...")
+        print("\n\n>>> Interrupted with Ctrl-c...\n(waiting for running tasks to be completed)\n")
+        
+        try:
+            # Record shutdown event
+            if hasattr(self, 'monitor'):
+                self.monitor.record_error("shutdown_initiated", "Graceful shutdown started")
+            
+            # Set stop event to break main loop
+            if hasattr(self, 'stop_event'):
+                self.stop_event.set()
+            
+            # Cancel all running tasks except the current one
+            current_task = asyncio.current_task()
+            tasks_to_cancel = []
+            
+            for task in asyncio.all_tasks():
+                if task is not current_task and not task.done():
+                    tasks_to_cancel.append(task)
+                    task.cancel()
+            
+            if tasks_to_cancel:
+                self._logger.info(f"Cancelling {len(tasks_to_cancel)} running tasks...")
+                # Wait for tasks to be cancelled with timeout
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                        timeout=10.0  # 10 second timeout for graceful shutdown
+                    )
+                except asyncio.TimeoutError:
+                    self._logger.warning("Some tasks did not complete within shutdown timeout")
+            
+            self._logger.info("Graceful shutdown completed")
+            
+        except Exception as e:
+            self._logger.error(f"Error during shutdown: {e}")
+            if hasattr(self, 'monitor'):
+                self.monitor.record_error("shutdown_error", str(e))
     
     # ---------------------------------------
     async def _cleanup(self):
@@ -693,6 +916,73 @@ class Blotter:
             
         # Remove cached args file
         await self._remove_cached_args()
+    
+    async def _cleanup_with_monitoring(self):
+        """
+        Enhanced cleanup with monitoring and graceful resource management.
+        """
+        self._logger.info("Starting cleanup process...")
+        
+        try:
+            # Stop monitoring system first
+            if hasattr(self, 'monitor'):
+                self._logger.info("Stopping monitoring system...")
+                await self.monitor.stop_monitoring()
+            
+            # Clean up ZMQ socket with error handling
+            if self.socket:
+                try:
+                    self._logger.info("Closing ZeroMQ socket...")
+                    with self.monitor.time_operation("zmq_cleanup"):
+                        self.socket.close()
+                        await self.socket.drain()
+                    self.socket = None
+                    self.monitor.metrics_collector.update_connection_status("zeromq", False)
+                    self._logger.info("ZeroMQ socket closed successfully")
+                except Exception as e:
+                    self._logger.warning(f"Error closing ZeroMQ socket: {e}")
+                    self.monitor.record_error("zmq_cleanup_error", str(e))
+            
+            # Disconnect from IB with error handling
+            if hasattr(self, 'ezib') and self.ezib.connected:
+                try:
+                    self._logger.info("Disconnecting from Interactive Brokers...")
+                    with self.monitor.time_operation("ib_disconnect"):
+                        # Cancel all market data subscriptions
+                        # self.ezib.cancelMarketData()  # Uncomment if needed
+                        self.ezib.disconnect()
+                    self.monitor.metrics_collector.update_connection_status("ib", False)
+                    self._logger.info("Disconnected from Interactive Brokers successfully")
+                except Exception as e:
+                    self._logger.warning(f"Error disconnecting from IB: {e}")
+                    self.monitor.record_error("ib_disconnect_error", str(e))
+            
+            # Close Postgres connection pool with error handling
+            if self.pool:
+                try:
+                    self._logger.info("Closing database connection pool...")
+                    with self.monitor.time_operation("db_cleanup"):
+                        await self.pool.close()
+                    self.pool = None
+                    self.monitor.metrics_collector.update_connection_status("database", False)
+                    self._logger.info("Database connection pool closed successfully")
+                except Exception as e:
+                    self._logger.warning(f"Error closing database pool: {e}")
+                    self.monitor.record_error("db_cleanup_error", str(e))
+            
+            # Remove cached args file
+            try:
+                await self._remove_cached_args()
+                self._logger.info("Cached arguments file removed")
+            except Exception as e:
+                self._logger.warning(f"Error removing cached args: {e}")
+            
+            self._logger.info("Cleanup process completed successfully")
+            
+        except Exception as e:
+            self._logger.error(f"Critical error during cleanup: {e}")
+            if hasattr(self, 'monitor'):
+                self.monitor.record_error("cleanup_critical_error", str(e))
 
 # ===========================================
 #  Utility functions 
