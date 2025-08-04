@@ -8,8 +8,9 @@ class MainBlotter(Blotter):
 
 # ===========================================
 if __name__ == "__main__":
-    util.logToConsole(logging.INFO)
-    logging.getLogger('ib_async').setLevel(logging.CRITICAL)
+    util.logToConsole("DEBUG")
+    logging.getLogger('ezib_async').setLevel(logging.ERROR)
+    logging.getLogger('ib_async').setLevel(logging.ERROR)
 
     blotter = MainBlotter()
     asyncio.run(blotter.run())
