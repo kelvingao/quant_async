@@ -1,0 +1,27 @@
+[run]
+source = src/quant_async
+omit = 
+    */tests/*
+    */test_*
+    */conftest.py
+    */setup.py
+    */venv/*
+    */.venv/*
+    */migrations/*
+    */alembic/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    @abstract
+    @abc.abstractmethod
+    
+show_missing = true
+precision = 1
+
+[html]
+directory = htmlcov
