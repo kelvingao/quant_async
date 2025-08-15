@@ -1,6 +1,5 @@
 import msgspec
-from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Optional
 
 # Define DOM (Depth of Market) level data
 class DOMLevel(msgspec.Struct, gc=False, frozen=True):
