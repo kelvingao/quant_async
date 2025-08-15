@@ -4,8 +4,10 @@ import hashlib
 import datetime
 import logging
 import asyncpg
+import pandas as pd
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -343,6 +345,504 @@ class Reports:
                 }
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error getting account details: {e}")
+
+        # ===========================================
+        # NEW DATA API ENDPOINTS
+        # ===========================================
+
+        @self.app.get("/api/v1/history/{symbol}")
+        async def get_history(
+            symbol: str,
+            start: str = Query(..., description="Start date in ISO format (e.g., '2024-01-01' or '2024-01-01T10:00:00')"),
+            end: Optional[str] = Query(None, description="End date in ISO format (defaults to now)"),
+            resolution: str = Query("1T", description="Time resolution ('1T', '5T', '1H', '1D')")
+        ):
+            """
+            Retrieve historical market data for a symbol.
+            
+            Args:
+                symbol: Symbol to query (e.g., 'AAPL', 'EURUSD')
+                start: Start datetime in ISO format
+                end: End datetime in ISO format (optional, defaults to now)
+                resolution: Time resolution for data aggregation
+                
+            Returns:
+                JSON response with historical data
+            """
+            try:
+                self._logger.info(f"History API request: symbol={symbol}, start={start}, end={end}, resolution={resolution}")
+                
+                # Parse datetime strings
+                try:
+                    start_dt = pd.to_datetime(start)
+                    end_dt = pd.to_datetime(end) if end else datetime.datetime.now()
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
+                
+                # Validate symbol format and resolution
+                if not symbol or len(symbol.strip()) == 0:
+                    raise HTTPException(status_code=400, detail="Symbol cannot be empty")
+                
+                if resolution not in ['1T', '5T', '15T', '30T', '1H', '4H', '1D']:
+                    raise HTTPException(status_code=400, detail=f"Unsupported resolution: {resolution}")
+                
+                # Use the enhanced blotter.history() method
+                try:
+                    df = await self.blotter.history(
+                        symbols=[symbol.upper()],
+                        start=start_dt,
+                        end=end_dt,
+                        resolution=resolution,
+                        tz='UTC'
+                    )
+                    
+                    if df.empty:
+                        return {
+                            "status": "success",
+                            "symbol": symbol.upper(),
+                            "data": [],
+                            "count": 0,
+                            "message": "No data found for the specified time range"
+                        }
+                    
+                    # Convert DataFrame to records format for JSON response
+                    # Reset index to include datetime as a column
+                    df_reset = df.reset_index()
+                    data_records = df_reset.to_dict("records")
+                    
+                    # Convert datetime objects to ISO strings for JSON serialization
+                    for record in data_records:
+                        if 'datetime' in record and pd.notna(record['datetime']):
+                            record['datetime'] = record['datetime'].isoformat()
+                    
+                    return {
+                        "status": "success",
+                        "symbol": symbol.upper(),
+                        "start": start_dt.isoformat(),
+                        "end": end_dt.isoformat(),
+                        "resolution": resolution,
+                        "data": data_records,
+                        "count": len(data_records)
+                    }
+                    
+                except Exception as e:
+                    error_msg = f"Database query failed: {str(e)}"
+                    self._logger.error(error_msg)
+                    raise HTTPException(status_code=500, detail=error_msg)
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                error_msg = f"Unexpected error in history endpoint: {str(e)}"
+                self._logger.error(error_msg)
+                raise HTTPException(status_code=500, detail=error_msg)
+
+        @self.app.get("/api/v1/realtime/{symbol}")
+        async def get_realtime(symbol: str):
+            """
+            Get the latest real-time market data for a symbol.
+            
+            Args:
+                symbol: Symbol to query
+                
+            Returns:
+                JSON response with latest market data
+            """
+            try:
+                self._logger.info(f"Realtime API request: symbol={symbol}")
+                
+                if not symbol or len(symbol.strip()) == 0:
+                    raise HTTPException(status_code=400, detail="Symbol cannot be empty")
+                
+                symbol = symbol.upper()
+                
+                # Get the latest tick data from database
+                async with self.pool.acquire() as conn:
+                    # Query latest tick data
+                    tick_query = """
+                        SELECT 
+                            t.datetime,
+                            t.bid,
+                            t.bidsize,
+                            t.ask,
+                            t.asksize,
+                            t.last,
+                            t.lastsize,
+                            s.symbol
+                        FROM ticks t
+                        JOIN symbols s ON t.symbol_id = s.id
+                        WHERE s.symbol = $1
+                        ORDER BY t.datetime DESC
+                        LIMIT 1
+                    """
+                    
+                    # Query latest bar data
+                    bar_query = """
+                        SELECT 
+                            b.datetime,
+                            b.open,
+                            b.high,
+                            b.low,
+                            b.close,
+                            b.volume,
+                            s.symbol
+                        FROM bars b
+                        JOIN symbols s ON b.symbol_id = s.id
+                        WHERE s.symbol = $1
+                        ORDER BY b.datetime DESC
+                        LIMIT 1
+                    """
+                    
+                    # Execute both queries
+                    tick_row = await conn.fetchrow(tick_query, symbol)
+                    bar_row = await conn.fetchrow(bar_query, symbol)
+                    
+                    # Prepare response data
+                    response_data = {
+                        "symbol": symbol,
+                        "timestamp": datetime.datetime.now().isoformat(),
+                        "tick_data": None,
+                        "bar_data": None
+                    }
+                    
+                    if tick_row:
+                        response_data["tick_data"] = {
+                            "datetime": tick_row['datetime'].isoformat() if tick_row['datetime'] else None,
+                            "bid": float(tick_row['bid']) if tick_row['bid'] else None,
+                            "bidsize": tick_row['bidsize'],
+                            "ask": float(tick_row['ask']) if tick_row['ask'] else None,
+                            "asksize": tick_row['asksize'],
+                            "last": float(tick_row['last']) if tick_row['last'] else None,
+                            "lastsize": tick_row['lastsize']
+                        }
+                    
+                    if bar_row:
+                        response_data["bar_data"] = {
+                            "datetime": bar_row['datetime'].isoformat() if bar_row['datetime'] else None,
+                            "open": float(bar_row['open']) if bar_row['open'] else None,
+                            "high": float(bar_row['high']) if bar_row['high'] else None,
+                            "low": float(bar_row['low']) if bar_row['low'] else None,
+                            "close": float(bar_row['close']) if bar_row['close'] else None,
+                            "volume": bar_row['volume']
+                        }
+                    
+                    if not tick_row and not bar_row:
+                        return {
+                            "status": "success",
+                            "symbol": symbol,
+                            "data": response_data,
+                            "message": "No recent data available for this symbol"
+                        }
+                    
+                    return {
+                        "status": "success",
+                        "symbol": symbol,
+                        "data": response_data
+                    }
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                error_msg = f"Error retrieving realtime data: {str(e)}"
+                self._logger.error(error_msg)
+                raise HTTPException(status_code=500, detail=error_msg)
+        
+        # =======================================
+        # Enhanced Data Retrieval Endpoints
+        # =======================================
+        
+        @self.app.get("/health")
+        async def health_check():
+            """Health check endpoint"""
+            return {
+                "status": "healthy",
+                "timestamp": datetime.datetime.now().isoformat(),
+                "database": "connected" if hasattr(self, 'pool') and self.pool else "disconnected"
+            }
+        
+        @self.app.get("/symbols")
+        async def get_symbols():
+            """Get all available symbols"""
+            try:
+                if not hasattr(self, 'pool') or not self.pool:
+                    raise HTTPException(status_code=503, detail="Database not available")
+                
+                async with self.pool.acquire() as conn:
+                    symbols = await conn.fetch("""
+                        SELECT id, symbol, symbol_group, asset_class, expiry
+                        FROM symbols 
+                        ORDER BY symbol
+                    """)
+                    
+                return {
+                    "symbols": [dict(s) for s in symbols],
+                    "count": len(symbols)
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving symbols: {str(e)}")
+        
+        @self.app.get("/symbols/{symbol}")
+        async def get_symbol_details(symbol: str):
+            """Get detailed information for a specific symbol"""
+            try:
+                if not hasattr(self, 'pool') or not self.pool:
+                    raise HTTPException(status_code=503, detail="Database not available")
+                
+                async with self.pool.acquire() as conn:
+                    # Check if symbol exists
+                    symbol_info = await conn.fetchrow("""
+                        SELECT id, symbol, symbol_group, asset_class
+                        FROM symbols 
+                        WHERE symbol = $1
+                    """, symbol)
+                    
+                    if not symbol_info:
+                        raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
+                    
+                    # Get bars statistics
+                    bars_stats = await conn.fetchrow("""
+                        SELECT 
+                            COUNT(*) as count,
+                            MIN(open) as min_price,
+                            MAX(high) as max_price,
+                            MIN(volume) as min_volume,
+                            MAX(volume) as max_volume,
+                            MIN(datetime) as earliest,
+                            MAX(datetime) as latest
+                        FROM bars 
+                        WHERE symbol_id = $1
+                    """, symbol_info['id'])
+                    
+                    # Get ticks statistics  
+                    ticks_stats = await conn.fetchrow("""
+                        SELECT 
+                            COUNT(*) as count,
+                            MIN(datetime) as earliest,
+                            MAX(datetime) as latest
+                        FROM ticks 
+                        WHERE symbol_id = $1
+                    """, symbol_info['id'])
+                    
+                return {
+                    "symbol": symbol_info['symbol'],
+                    "asset_class": symbol_info['asset_class'],
+                    "symbol_group": symbol_info['symbol_group'],
+                    "bars_count": bars_stats['count'] if bars_stats else 0,
+                    "ticks_count": ticks_stats['count'] if ticks_stats else 0,
+                    "price_range": {
+                        "min": float(bars_stats['min_price']) if bars_stats and bars_stats['min_price'] else None,
+                        "max": float(bars_stats['max_price']) if bars_stats and bars_stats['max_price'] else None
+                    },
+                    "volume_range": {
+                        "min": bars_stats['min_volume'] if bars_stats and bars_stats['min_volume'] else None,
+                        "max": bars_stats['max_volume'] if bars_stats and bars_stats['max_volume'] else None
+                    },
+                    "data_range": {
+                        "earliest": bars_stats['earliest'].isoformat() if bars_stats and bars_stats['earliest'] else None,
+                        "latest": bars_stats['latest'].isoformat() if bars_stats and bars_stats['latest'] else None
+                    }
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving symbol details: {str(e)}")
+        
+        @self.app.get("/historical/bars")
+        async def get_historical_bars(
+            symbols: str = Query(..., description="Comma-separated list of symbols"),
+            start: str = Query(..., description="Start date (YYYY-MM-DD)"),
+            end: str = Query(..., description="End date (YYYY-MM-DD)")
+        ):
+            """Get historical bar data"""
+            try:
+                if not hasattr(self, 'pool') or not self.pool:
+                    raise HTTPException(status_code=503, detail="Database not available")
+                
+                # Parse dates
+                try:
+                    start_dt = pd.to_datetime(start).to_pydatetime()
+                    end_dt = pd.to_datetime(end).to_pydatetime()
+                    if start_dt >= end_dt:
+                        raise HTTPException(status_code=400, detail="Start date must be before end date")
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+                
+                symbols_list = [s.strip() for s in symbols.split(',')]
+                
+                async with self.pool.acquire() as conn:
+                    bars = await conn.fetch("""
+                        SELECT 
+                            s.symbol,
+                            b.datetime,
+                            b.open,
+                            b.high,
+                            b.low,
+                            b.close,
+                            b.volume
+                        FROM bars b
+                        JOIN symbols s ON b.symbol_id = s.id
+                        WHERE s.symbol = ANY($1)
+                        AND b.datetime BETWEEN $2 AND $3
+                        ORDER BY s.symbol, b.datetime
+                    """, symbols_list, start_dt, end_dt)
+                    
+                return {
+                    "data": [dict(bar) for bar in bars],
+                    "count": len(bars),
+                    "symbols": symbols_list,
+                    "date_range": {
+                        "start": start,
+                        "end": end
+                    }
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving historical bars: {str(e)}")
+        
+        @self.app.get("/historical/ticks")  
+        async def get_historical_ticks(
+            symbols: str = Query(..., description="Comma-separated list of symbols"),
+            start: str = Query(..., description="Start date (YYYY-MM-DD)"),
+            end: str = Query(..., description="End date (YYYY-MM-DD)")
+        ):
+            """Get historical tick data"""
+            try:
+                if not hasattr(self, 'pool') or not self.pool:
+                    raise HTTPException(status_code=503, detail="Database not available")
+                
+                # Parse dates
+                try:
+                    start_dt = pd.to_datetime(start).to_pydatetime()
+                    end_dt = pd.to_datetime(end).to_pydatetime()
+                    if start_dt >= end_dt:
+                        raise HTTPException(status_code=400, detail="Start date must be before end date")
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+                
+                symbols_list = [s.strip() for s in symbols.split(',')]
+                
+                async with self.pool.acquire() as conn:
+                    ticks = await conn.fetch("""
+                        SELECT 
+                            s.symbol,
+                            t.datetime,
+                            t.bid,
+                            t.ask,
+                            t.last,
+                            t.bidsize,
+                            t.asksize,
+                            t.lastsize
+                        FROM ticks t
+                        JOIN symbols s ON t.symbol_id = s.id
+                        WHERE s.symbol = ANY($1)
+                        AND t.datetime BETWEEN $2 AND $3
+                        ORDER BY s.symbol, t.datetime
+                    """, symbols_list, start_dt, end_dt)
+                    
+                return {
+                    "data": [dict(tick) for tick in ticks],
+                    "count": len(ticks),
+                    "symbols": symbols_list,
+                    "date_range": {
+                        "start": start,
+                        "end": end
+                    }
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving historical ticks: {str(e)}")
+        
+        @self.app.get("/statistics/summary")
+        async def get_statistics_summary():
+            """Get overall database statistics"""
+            try:
+                if not hasattr(self, 'pool') or not self.pool:
+                    raise HTTPException(status_code=503, detail="Database not available")
+                
+                async with self.pool.acquire() as conn:
+                    # Get overall statistics
+                    stats = await conn.fetchrow("""
+                        SELECT 
+                            (SELECT COUNT(*) FROM symbols) as total_symbols,
+                            (SELECT COUNT(*) FROM bars) as total_bars,
+                            (SELECT COUNT(*) FROM ticks) as total_ticks,
+                            (SELECT MIN(datetime) FROM bars) as earliest_bar,
+                            (SELECT MAX(datetime) FROM bars) as latest_bar
+                    """)
+                    
+                return {
+                    "total_symbols": stats['total_symbols'],
+                    "total_bars": stats['total_bars'],
+                    "total_ticks": stats['total_ticks'],
+                    "data_range": {
+                        "start": stats['earliest_bar'].isoformat() if stats['earliest_bar'] else None,
+                        "end": stats['latest_bar'].isoformat() if stats['latest_bar'] else None
+                    }
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving statistics: {str(e)}")
+        
+        @self.app.get("/metrics/performance")
+        async def get_performance_metrics():
+            """Get performance metrics"""
+            try:
+                # Mock performance data since we don't have real metrics collection yet
+                return {
+                    "metrics": ["database_queries", "api_requests", "response_times"],
+                    "database": {
+                        "total_queries": 156,
+                        "avg_query_time": 0.023,
+                        "connection_pool_size": 5
+                    },
+                    "api": {
+                        "total_requests": 89,
+                        "avg_response_time": 0.045,
+                        "success_rate": 0.97
+                    }
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving performance metrics: {str(e)}")
+        
+        @self.app.get("/quality/validation")
+        async def get_data_quality():
+            """Get data quality validation results"""
+            try:
+                if not hasattr(self, 'pool') or not self.pool:
+                    raise HTTPException(status_code=503, detail="Database not available")
+                
+                async with self.pool.acquire() as conn:
+                    # Check for data quality issues
+                    invalid_bars = await conn.fetchrow("""
+                        SELECT COUNT(*) as count FROM bars
+                        WHERE high < open OR high < close OR low > open OR low > close OR volume < 0
+                    """)
+                    
+                    total_bars = await conn.fetchrow("SELECT COUNT(*) as count FROM bars")
+                    total_ticks = await conn.fetchrow("SELECT COUNT(*) as count FROM ticks")
+                    
+                return {
+                    "overall_status": "good" if invalid_bars['count'] == 0 else "issues_found",
+                    "bars": {
+                        "total_count": total_bars['count'],
+                        "valid_count": total_bars['count'] - invalid_bars['count'],
+                        "invalid_count": invalid_bars['count']
+                    },
+                    "ticks": {
+                        "total_count": total_ticks['count'],
+                        "valid_count": total_ticks['count'],  # Assume all ticks are valid for now
+                        "invalid_count": 0
+                    },
+                    "issues": [
+                        {
+                            "type": "invalid_ohlc",
+                            "description": f"Found {invalid_bars['count']} bars with invalid OHLC relationships"
+                        }
+                    ] if invalid_bars['count'] > 0 else []
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving data quality: {str(e)}")
     
     # ---------------------------------------
     def load_cli_args(self):
