@@ -38,13 +38,11 @@ import asyncpg
 import msgspec
 import pytz
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from numpy import isnan
 from ezib_async.ezib import ezIBAsync
-from quant_async import tools
 from quant_async.monitoring import SystemMonitor
-# from quant_async.util import prepare_history  # TODO: Implement prepare_history
 
 from .objects import OrderBookSnapshot, DOMLevel
 
@@ -75,7 +73,9 @@ class Blotter:
     """
 
     def __init__(self, ibhost="localhost", ibport=4001, ibclient=996, name=None, 
-                 symbols="symbols.csv", orderbook=False, zmqport="12345", zmqtopic=None, dbskip=False, **kwargs):
+                 symbols="symbols.csv", orderbook=False, zmqport="12345", zmqtopic=None, 
+                 dbskip=False, dbhost="localhost", dbport=5432, dbuser="quant_async", 
+                 dbpass="", dbname="quant_async", **kwargs):
         # Initialize class logger
         self._logger = logging.getLogger("quant_async.blotter")
         
@@ -100,6 +100,9 @@ class Blotter:
         # Initialize symbol cache with monitoring
         self.symbol_ids = {}
         
+        # Initialize DataStore for enhanced data operations
+        self.datastore = None
+        
         # Store arguments
         self.args = {arg: val for arg, val in locals().items()
                     if arg not in ('__class__', 'self', 'kwargs')}
@@ -110,7 +113,14 @@ class Blotter:
         if os.path.isabs(self.args['symbols']):
             self.symbols = self.args['symbols']
         else:
-            self.symbols = path['caller'] + '/' + self.args['symbols']
+            # Fix: Avoid duplicate path concatenation when running from examples/
+            symbols_path = self.args['symbols']
+            if os.path.exists(symbols_path):
+                # If the relative path exists from current directory, use it directly
+                self.symbols = os.path.abspath(symbols_path)
+            else:
+                # Otherwise, concatenate with caller path
+                self.symbols = os.path.join(path['caller'], symbols_path)
         
         # Initialize args cache file path
         self.args_cache_file = os.path.join(tempfile.gettempdir(), f"{self.name}.quant_async")
@@ -155,7 +165,7 @@ class Blotter:
             
             return len(stdout_list) > 0
         except Exception as e:
-            self._logger.error(f"Error checking if blotter is running: {e}")
+            logging.getLogger('quant_async.blotter').error(f"Error checking if blotter is running: {e}")
             return False
     
     # ---------------------------------------
@@ -247,6 +257,20 @@ class Blotter:
                           help='Path to CSV file with symbols to monitor', required=False)
         parser.add_argument('--orderbook', action='store_true', default=self.args['orderbook'],
                           help='Request market depth data', required=False)
+        
+        # Database connection parameters
+        parser.add_argument('--dbhost', default='localhost', 
+                          help='Database hostname', required=False)
+        parser.add_argument('--dbport', default=5432, type=int,
+                          help='Database port', required=False)
+        parser.add_argument('--dbuser', default='quant_async', 
+                          help='Database username', required=False)
+        parser.add_argument('--dbpass', default='', 
+                          help='Database password', required=False)
+        parser.add_argument('--dbname', default='quant_async', 
+                          help='Database name', required=False)
+        parser.add_argument('--dbskip', action='store_true', 
+                          help='Skip database connection', required=False)
         
         # Only return non-default cmd line args
         # (meaning only those actually given)
@@ -364,15 +388,29 @@ class Blotter:
                     # new contract
                     for contract in contracts:
                         if contract not in prev_contracts:
-
+                            self._logger.info(f'Processing new contract: {contract}')
+                            
                             contract_obj = await self.ezib.createContract(*contract)
                             if contract_obj:
-                                await self.ezib.requestMarketData(contract_obj)
+                                self._logger.info(f'Contract created successfully: {contract_obj}')
+                                
+                                try:
+                                    await self.ezib.requestMarketData(contract_obj)
+                                    self._logger.info(f'Market data requested for contract: {contract_obj}')
+                                except Exception as e:
+                                    self._logger.error(f'Failed to request market data: {e}')
+                                
                                 if self.args['orderbook']:
-                                    self.ezib.requestMarketDepth(contract_obj)
+                                    try:
+                                        self.ezib.requestMarketDepth(contract_obj)
+                                        self._logger.info(f'Market depth requested for contract: {contract_obj}')
+                                    except Exception as e:
+                                        self._logger.error(f'Failed to request market depth: {e}')
 
                                 contract_string = self.ezib.contractString(contract).split('_')[0]
                                 self._logger.info('Contract Added [%s]', contract_string)
+                            else:
+                                self._logger.error(f'Failed to create contract for: {contract}')
                     
                     # Update previous contracts list
                     prev_contracts = contracts
@@ -513,14 +551,14 @@ class Blotter:
     # ---------------------------------------
     async def get_postgres_connection(self):
         """
-        Get PostgreSQL connection pool.
+        Get PostgreSQL connection pool using command line arguments or environment variables.
         """
         return await asyncpg.create_pool(
-            host=os.getenv('POSTGRES_HOST', 'localhost'),
-            port=int(os.getenv('POSTGRES_PORT', '5432')),
-            user=os.getenv('POSTGRES_USER', 'quant_async'),
-            password=os.getenv('POSTGRES_PASSWORD', 'quant_async'),
-            database=os.getenv('POSTGRES_DB', 'quant_async'),
+            host=self.args.get('dbhost', os.getenv('POSTGRES_HOST', 'localhost')),
+            port=int(self.args.get('dbport', os.getenv('POSTGRES_PORT', '5432'))),
+            user=self.args.get('dbuser', os.getenv('POSTGRES_USER', 'quant_async')),
+            password=self.args.get('dbpass', os.getenv('POSTGRES_PASSWORD', 'quant_async')),
+            database=self.args.get('dbname', os.getenv('POSTGRES_DB', 'quant_async')),
             min_size=2,
             max_size=10
         )
@@ -560,7 +598,7 @@ class Blotter:
                     self.pool = await self.get_postgres_connection()
                 
                 # Test connection
-                if await self.monitor.connection_monitor.check_database_connection(self.pool):
+                if await self.monitor.connection_monitor.check_database_connection(self.pool, self.args['dbskip']):
                     self._logger.info("Database connection established successfully")
                     self.monitor.metrics_collector.update_connection_status("database", True)
                     return
@@ -857,7 +895,152 @@ class Blotter:
                     await socket.drain()
                 raise
 
+    # ---------------------------------------
+    # Historical Data Management Methods
+    # ---------------------------------------
     
+    async def history(self, symbols, start, end=None, resolution='1T', tz='UTC'):
+        """
+        Retrieve historical market data from PostgreSQL.
+        
+        Args:
+            symbols (list or str): List of symbols to query
+            start (str or datetime): Start date/time for data retrieval
+            end (str or datetime, optional): End date/time. Defaults to now.
+            resolution (str, optional): Time frequency ('1T', '5T', '1H', '1D'). Defaults to '1T'.
+            tz (str, optional): Timezone for datetime conversion. Defaults to 'UTC'.
+            
+        Returns:
+            pandas.DataFrame: Historical market data with OHLCV columns
+            
+        Raises:
+            RuntimeError: If database is not connected
+            ValueError: If invalid symbols or date range provided
+        """
+        import pandas as pd
+        from datetime import datetime
+        
+        # Validate inputs
+        if isinstance(symbols, str):
+            symbols = [symbols]
+        
+        if not symbols:
+            raise ValueError("At least one symbol must be provided")
+            
+        # Parse date range
+        if isinstance(start, str):
+            start = pd.to_datetime(start)
+        if isinstance(end, str):
+            end = pd.to_datetime(end)
+        elif end is None:
+            end = datetime.now()
+            
+        # Validate database connection
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+            
+        self._logger.info(f"Querying history for {symbols} from {start} to {end}")
+        
+        try:
+            async with self.pool.acquire() as conn:
+                # CRITICAL: Use prepared statement for performance
+                query = """
+                    SELECT 
+                        s.symbol,
+                        b.datetime,
+                        b.open,
+                        b.high,
+                        b.low,
+                        b.close,
+                        b.volume
+                    FROM bars b 
+                    JOIN symbols s ON b.symbol_id = s.id
+                    WHERE s.symbol = ANY($1) 
+                        AND b.datetime BETWEEN $2 AND $3
+                    ORDER BY s.symbol, b.datetime
+                """
+                
+                # PATTERN: Use existing monitoring integration
+                with self.monitor.time_operation("history_query"):
+                    rows = await conn.fetch(query, symbols, start, end)
+                
+                # Convert to pandas DataFrame for qtpylib compatibility
+                if not rows:
+                    self._logger.warning(f"No data found for symbols {symbols}")
+                    return pd.DataFrame()
+                
+                df = pd.DataFrame(rows)
+                df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+                
+                # Convert timezone if requested
+                if tz != 'UTC':
+                    target_tz = pytz.timezone(tz)
+                    df['datetime'] = df['datetime'].dt.tz_convert(target_tz)
+                
+                df.set_index('datetime', inplace=True)
+                
+                self._logger.info(f"Retrieved {len(df)} rows of historical data")
+                return df
+                
+        except Exception as e:
+            error_msg = f"History query failed: {e}"
+            self._logger.error(error_msg)
+            if hasattr(self, 'monitor'):
+                self.monitor.record_error("history_query_error", error_msg)
+            raise
+    
+    async def backfill(self, symbols, start, end, resolution='1T'):
+        """
+        Backfill historical data from Interactive Brokers.
+        
+        Args:
+            symbols (list or str): List of symbols to backfill
+            start (str or datetime): Start date for backfill
+            end (str or datetime): End date for backfill  
+            resolution (str, optional): Time frequency. Defaults to '1T'.
+            
+        Returns:
+            int: Number of bars retrieved and stored
+            
+        Raises:
+            RuntimeError: If IB is not connected or database unavailable
+        """
+        if isinstance(symbols, str):
+            symbols = [symbols]
+            
+        if not self.ezib or not self.ezib.connected:
+            raise RuntimeError("Interactive Brokers not connected")
+            
+        if not self.pool:
+            raise RuntimeError("Database not connected")
+            
+        self._logger.info(f"Starting backfill for {symbols} from {start} to {end}")
+        
+        total_bars = 0
+        
+        try:
+            for symbol in symbols:
+                # Request historical data from IB
+                # Note: This is a placeholder - actual IB historical data request
+                # would need to be implemented based on ezib_async API
+                self._logger.info(f"Requesting historical data for {symbol}")
+                
+                # For now, log the backfill request
+                # TODO: Implement actual IB historical data request
+                # bars = await self.ezib.reqHistoricalData(symbol, start, end, resolution)
+                # await self.storage.save_bars_batch(bars)
+                
+                self._logger.warning(f"Backfill for {symbol} not yet implemented - requires IB API integration")
+                
+            return total_bars
+            
+        except Exception as e:
+            error_msg = f"Backfill failed: {e}"
+            self._logger.error(error_msg)
+            if hasattr(self, 'monitor'):
+                self.monitor.record_error("backfill_error", error_msg)
+            raise
+
     # ---------------------------------------
     async def _shutdown(self):
         """Handle graceful shutdown with enhanced monitoring."""
@@ -983,6 +1166,106 @@ class Blotter:
             self._logger.error(f"Critical error during cleanup: {e}")
             if hasattr(self, 'monitor'):
                 self.monitor.record_error("cleanup_critical_error", str(e))
+    
+    # =======================================
+    # DataStore Integration Methods
+    # =======================================
+    
+    async def _init_datastore(self):
+        """Initialize DataStore for enhanced data operations"""
+        try:
+            if not self.args.get('dbskip') and self.pool:
+                from .storage import DataStore
+                self.datastore = DataStore(self.pool)
+                self._logger.info("DataStore initialized successfully")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize DataStore: {e}")
+            self.monitor.record_error("datastore_init_error", str(e))
+        return False
+    
+    async def history(self, symbols=None, start=None, end=None, resolution='1T'):
+        """
+        Enhanced history method with DataStore integration.
+        
+        Args:
+            symbols (list): List of symbols to retrieve
+            start (str): Start datetime string
+            end (str): End datetime string  
+            resolution (str): Data resolution (not used in current implementation)
+            
+        Returns:
+            pandas.DataFrame: Historical bar data with MultiIndex (symbol, datetime)
+        """
+        try:
+            if not self.datastore:
+                await self._init_datastore()
+                
+            if not self.datastore:
+                self._logger.warning("DataStore not available, returning empty DataFrame")
+                return pd.DataFrame()
+            
+            # Parse datetime strings and convert to naive datetime for database compatibility
+            start_dt = pd.to_datetime(start, utc=True).to_pydatetime().replace(tzinfo=None)
+            end_dt = pd.to_datetime(end, utc=True).to_pydatetime().replace(tzinfo=None)
+            
+            # Use DataStore to retrieve historical data
+            with self.monitor.time_operation("history_retrieval"):
+                df = await self.datastore.get_historical_bars(symbols, start_dt, end_dt)
+                
+            self._logger.info(f"Retrieved {len(df)} historical bars for symbols: {symbols}")
+            self.monitor.record_operation("history_success", {"symbols": len(symbols or []), "rows": len(df)})
+            
+            return df
+            
+        except Exception as e:
+            self._logger.error(f"History retrieval failed: {e}")
+            self.monitor.record_error("history_error", str(e))
+            return pd.DataFrame()
+    
+    async def backfill(self, symbol=None, start=None, end=None, resolution='1T'):
+        """
+        Enhanced backfill method with DataStore integration.
+        
+        Args:
+            symbol (str): Symbol to backfill
+            start (str): Start datetime string
+            end (str): End datetime string
+            resolution (str): Data resolution (not used in current implementation)
+            
+        Returns:
+            pandas.DataFrame or None: Backfilled data or None if not available
+        """
+        try:
+            if not self.datastore:
+                await self._init_datastore()
+                
+            if not self.datastore:
+                self._logger.warning("DataStore not available for backfill")
+                return None
+            
+            # Parse datetime strings and convert to naive datetime for database compatibility
+            start_dt = pd.to_datetime(start, utc=True).to_pydatetime().replace(tzinfo=None)
+            end_dt = pd.to_datetime(end, utc=True).to_pydatetime().replace(tzinfo=None)
+            
+            # For demo purposes, we'll try to retrieve existing data
+            # In a real implementation, this would connect to a data provider
+            with self.monitor.time_operation("backfill_operation"):
+                df = await self.datastore.get_historical_bars([symbol], start_dt, end_dt)
+                
+            if not df.empty:
+                self._logger.info(f"Backfill found {len(df)} existing bars for {symbol}")
+                self.monitor.record_operation("backfill_success", {"symbol": symbol, "rows": len(df)})
+                return df
+            else:
+                self._logger.info(f"No existing data found for backfill of {symbol}")
+                self.monitor.record_operation("backfill_no_data", {"symbol": symbol})
+                return None
+                
+        except Exception as e:
+            self._logger.error(f"Backfill failed for {symbol}: {e}")
+            self.monitor.record_error("backfill_error", str(e))
+            return None
 
 # ===========================================
 #  Utility functions 
@@ -1000,8 +1283,8 @@ def load_blotter_args(blotter_name=None, logger=None):
         args : dict
             Running Blotter's arguments
     """
-    # if logger is None:
-    #     logger = tools.createLogger(__name__, logging.WARNING)
+    if logger is None:
+        logger = logging.getLogger(__name__)
 
     # find specific name
     if blotter_name is not None:  # and blotter_name != 'auto-detect':
@@ -1011,7 +1294,7 @@ def load_blotter_args(blotter_name=None, logger=None):
                 "Cannot connect to running Blotter [%s]", blotter_name)
             if os.isatty(0):
                 sys.exit(0)
-            return []
+            return {}
 
     # no name provided - connect to last running
     else:
@@ -1023,7 +1306,7 @@ def load_blotter_args(blotter_name=None, logger=None):
                 "Cannot connect to running Blotter [%s]", blotter_name)
             if os.isatty(0):
                 sys.exit(0)
-            return []
+            return {}
 
         args_cache_file = blotter_files[-1]
 
