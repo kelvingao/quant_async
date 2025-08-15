@@ -226,15 +226,22 @@ class ConnectionMonitor:
             self.metrics_collector.record_error("ib_connection_check", str(e))
             return False
     
-    async def check_database_connection(self, pool: Optional[asyncpg.Pool]) -> bool:
+    async def check_database_connection(self, pool: Optional[asyncpg.Pool], dbskip: bool = False) -> bool:
         """Check database connection."""
         if pool is None:
-            self.health_checker.update_status(
-                "database",
-                "degraded",
-                "Database connection disabled (dbskip=True)"
-            )
-            return True  # Not an error if intentionally skipped
+            if dbskip:
+                self.health_checker.update_status(
+                    "database",
+                    "degraded",
+                    "Database connection disabled (dbskip=True)"
+                )
+            else:
+                self.health_checker.update_status(
+                    "database",
+                    "unhealthy",
+                    "Database connection pool not available"
+                )
+            return dbskip  # Only return True if intentionally skipped
         
         try:
             async with pool.acquire() as conn:
