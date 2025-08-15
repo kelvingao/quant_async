@@ -44,6 +44,7 @@ dependencies = [
     "requests>=2.32.3",
     "uvicorn>=0.30.0",
     "twine>=6.1.0",
+    "httpx>=0.28.1",
 ]
 
 [project.urls]
