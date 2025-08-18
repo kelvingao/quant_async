@@ -38,13 +38,14 @@ import asyncpg
 import msgspec
 import pytz
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from numpy import isnan
 from ezib_async.ezib import ezIBAsync
 from quant_async.monitoring import SystemMonitor
 
 from .objects import OrderBookSnapshot, DOMLevel
+from . import tools
 
 path = {
     "library": os.path.dirname(os.path.realpath(__file__)),
@@ -103,6 +104,10 @@ class Blotter:
         # Initialize DataStore for enhanced data operations
         self.datastore = None
         
+        # Store tickers and bars for market data
+        self.tickers = {}  # symbol -> ticker object
+        self.bars = {}     # symbol -> bars object
+        
         # Store arguments
         self.args = {arg: val for arg, val in locals().items()
                     if arg not in ('__class__', 'self', 'kwargs')}
@@ -136,7 +141,17 @@ class Blotter:
     
     # ---------------------------------------
     def _register_events_handler(self):
+        """Register event handlers for market data from IB."""
+        self._logger.info("🔗 Registering IB event handlers...")
+        
         self.ezib.updateMarketDepthEvent += self.on_orderbook_received
+        self._logger.debug("✅ Registered updateMarketDepthEvent handler")
+        
+        # Add handler for ticker updates
+        self.ezib.quoteUpdateEvent += self.on_quote_received
+        self._logger.debug("✅ Registered quoteUpdateEvent handler")
+        
+        self._logger.info("🎯 Event handlers registration complete")
     
     # ---------------------------------------
     @staticmethod
@@ -433,8 +448,11 @@ class Blotter:
             ticker_snap (dict): The data to broadcast
             kind (str): The kind of data (e.g., "TICK", "BAR", "QUOTE", "ORDERBOOK")
         """
+        # DEBUG: Log broadcast attempt
+        self._logger.debug(f"🚀 broadcast() called with kind={kind}")
+        
         if self.socket is None:
-            self._logger.error("There is no socket connection setup")
+            self._logger.error("❌ There is no socket connection setup")
             self.monitor.record_error("zmq_socket_missing", "No ZeroMQ socket available")
             return
         
@@ -443,12 +461,16 @@ class Blotter:
             symbol = ticker_snap.get('symbol', 'unknown') if isinstance(ticker_snap, dict) else 'unknown'
             self.monitor.record_message(kind, symbol)
             
+            # DEBUG: Log before serialization
+            self._logger.debug(f"📦 Serializing {kind} data for {symbol}")
+            
             # Serialize and broadcast
             with self.monitor.time_operation(f"broadcast_{kind.lower()}"):
                 serialized = msgspec.msgpack.encode(ticker_snap)
                 self.socket.write([serialized])
                 
-            self._logger.debug(f"Broadcasted {kind} for {symbol}")
+            self._logger.info(f"✅ Successfully broadcasted {kind} for {symbol}")
+            self._logger.debug(f"📊 Data size: {len(serialized)} bytes")
             
         except (aiozmq.ZmqStreamClosed, ConnectionError) as e:
             error_msg = f"Error broadcasting {kind} data via ZeroMQ: {e}"
@@ -520,6 +542,364 @@ class Blotter:
         # orderbook["kind"] = "ORDERBOOK"
 
     # This method is implemented as async above
+    
+    # ---------------------------------------
+    # async def on_tickers_update(self, tickers):
+    #     """
+    #     Handle pending tickers event - called when there are ticker updates.
+    #     This is triggered by pendingTickersEvent from ib_async.
+    #     """
+    #     self._logger.debug(f"🔔 on_tickers_update() called with {len(tickers)} tickers")
+        
+    #     for i, ticker in enumerate(tickers):
+    #         self._logger.debug(f"📈 Processing ticker {i+1}/{len(tickers)}")
+    #         # Process each updated ticker as a quote
+    #         await self.on_quote_received(ticker)
+    
+    # ---------------------------------------
+    async def on_quote_received(self, tickerId):
+        """
+        Process quote updates from IB.
+        
+        Args:
+            tickerId: Integer ticker ID from ezib's quoteUpdateEvent
+        """
+        try:
+            # DEBUG: Log that we received a quote
+            self._logger.debug(f"🔥 on_quote_received() called with tickerId: {tickerId}")
+            
+            # Get contract and market data from tickerId
+            if not hasattr(self.ezib, 'contracts') or tickerId not in self.ezib.contracts:
+                self._logger.warning(f"⚠️  No contract found for tickerId: {tickerId}")
+                return
+                
+            contract = self.ezib.contracts[tickerId]
+            
+            # Get market data from ezib
+            market_data = None
+            if hasattr(self.ezib, 'marketData') and tickerId in self.ezib.marketData:
+                market_data = self.ezib.marketData[tickerId]
+            elif hasattr(self.ezib, 'optionsData') and tickerId in self.ezib.optionsData:
+                market_data = self.ezib.optionsData[tickerId]
+            else:
+                self._logger.warning(f"⚠️  No market data found for tickerId: {tickerId}")
+                return
+            
+            # Extract symbol from contract
+            symbol = getattr(contract, 'symbol', 'UNKNOWN')
+            sec_type = getattr(contract, 'secType', 'STK') 
+            self._logger.info(f"📊 Processing quote for {symbol} ({sec_type}) - tickerId: {tickerId}")
+            
+            # DEBUG: Log available market data fields
+            if hasattr(market_data, 'columns'):
+                self._logger.debug(f"📊 Market data columns: {list(market_data.columns)}")
+            
+            # Build quote data dict from contract info
+            quote_data = {
+                "symbol": symbol,
+                "symbol_group": tools.gen_symbol_group(symbol),
+                "asset_class": tools.gen_asset_class(symbol),
+                "timestamp": datetime.now(timezone.utc),
+                "kind": "QUOTE"
+            }
+            
+            # Extract market data fields (market_data is typically a DataFrame)
+            if market_data is not None and len(market_data) > 0:
+                # Get the latest row if it's a DataFrame
+                if hasattr(market_data, 'iloc'):
+                    latest_data = market_data.iloc[-1] if len(market_data) > 0 else market_data.iloc[0]
+                else:
+                    latest_data = market_data
+                
+                # Add bid/ask/last data if available
+                for field in ['bid', 'ask', 'last', 'bidSize', 'askSize', 'lastSize', 'volume']:
+                    value = None
+                    try:
+                        # For pandas Series (from DataFrame.iloc[-1]), use bracket notation
+                        if hasattr(latest_data, 'index') and field in latest_data.index:
+                            value = latest_data[field]
+                        # For dict-like objects
+                        elif hasattr(latest_data, 'get') and field in latest_data:
+                            value = latest_data.get(field)
+                        # For objects with attributes (but avoid pandas methods)
+                        elif hasattr(latest_data, field) and not callable(getattr(latest_data, field)):
+                            value = getattr(latest_data, field)
+                    except (KeyError, IndexError, AttributeError):
+                        continue
+                        
+                    if value is not None and not (isinstance(value, float) and isnan(value)):
+                        if field in ['bid', 'ask', 'last']:
+                            quote_data[field] = tools.to_decimal(value)
+                        else:
+                            # Convert numpy types to Python native types for msgpack serialization
+                            if hasattr(value, 'item'):  # numpy scalar
+                                quote_data[field] = value.item()
+                            else:
+                                quote_data[field] = value
+            
+            # Handle options - add opt_ prefix to Greeks
+            if sec_type in ["OPT", "FOP"]:
+                # Look for options-specific fields in market data
+                if market_data is not None and len(market_data) > 0:
+                    latest_data = market_data.iloc[-1] if hasattr(market_data, 'iloc') else market_data
+                    
+                    options_fields = ['delta', 'gamma', 'vega', 'theta', 'impliedVol', 'undPrice', 'dividends', 'optVolume', 'optOpenInterest', 'optPrice']
+                    options_data = {}
+                    
+                    for field in options_fields:
+                        value = None
+                        try:
+                            # For pandas Series (from DataFrame.iloc[-1]), use bracket notation
+                            if hasattr(latest_data, 'index') and field in latest_data.index:
+                                value = latest_data[field]
+                            # For dict-like objects
+                            elif hasattr(latest_data, 'get') and field in latest_data:
+                                value = latest_data.get(field)
+                            # For objects with attributes (but avoid pandas methods)
+                            elif hasattr(latest_data, field) and not callable(getattr(latest_data, field)):
+                                value = getattr(latest_data, field)
+                        except (KeyError, IndexError, AttributeError):
+                            continue
+                            
+                        if value is not None and not (isinstance(value, float) and isnan(value)):
+                            # Convert numpy types to Python native types for msgpack serialization
+                            if hasattr(value, 'item'):  # numpy scalar
+                                value = value.item()
+                                
+                            # Map some field names
+                            if field == 'impliedVol':
+                                options_data["iv"] = value
+                            elif field == 'undPrice':
+                                options_data["underlying"] = value
+                            elif field == 'dividends':
+                                options_data["dividend"] = value
+                            elif field == 'optVolume':
+                                options_data["volume"] = value
+                            elif field == 'optOpenInterest':
+                                options_data["oi"] = value
+                            elif field == 'optPrice':
+                                options_data["price"] = value
+                            else:
+                                options_data[field] = value
+                    
+                    # Add opt_ prefix to all options fields
+                    if options_data:
+                        options_data = tools.mark_options_values(options_data)
+                        quote_data.update(options_data)
+            
+            # Special handling for CASH (forex)
+            if sec_type == "CASH":
+                # Synthesize mid price if no last
+                if (quote_data.get("last") is None and 
+                    quote_data.get("bid") is not None and 
+                    quote_data.get("ask") is not None):
+                    quote_data["last"] = (quote_data["bid"] + quote_data["ask"]) / 2
+                    
+                # Check if price changed for tick generation
+                if symbol in cash_ticks:
+                    if cash_ticks[symbol] != quote_data.get("last"):
+                        # Price changed, generate tick
+                        cash_ticks[symbol] = quote_data.get("last")
+                        # Note: we'd need to adapt on_tick_received to work with tickerId too
+                        # await self.on_tick_received(tickerId)
+                else:
+                    cash_ticks[symbol] = quote_data.get("last")
+            
+            # DEBUG: Log quote data before broadcast
+            self._logger.info(f"📡 Broadcasting QUOTE for {symbol}")
+            self._logger.debug(f"📦 Quote data: {quote_data}")
+            
+            # Broadcast quote data
+            asyncio.create_task(self.broadcast(quote_data, "QUOTE"))
+            
+            # DEBUG: Confirm broadcast task created
+            self._logger.debug("✅ Broadcast task created")
+            
+            # Database logging
+            if not self.args['dbskip'] and self.pool:
+                asyncio.create_task(self._log_quote_to_db(quote_data))
+                
+        except Exception as e:
+            self._logger.error(f"Error processing quote for tickerId {tickerId}: {e}")
+            self.monitor.record_error("quote_processing_error", str(e))
+    
+    # ---------------------------------------
+    async def on_tick_received(self, ticker):
+        """
+        Process tick data.
+        
+        Args:
+            ticker: ib_async Ticker object with last trade info
+        """
+        try:
+            tick_data = {
+                "symbol": ticker.contract.symbol if hasattr(ticker.contract, 'symbol') else "",
+                "symbol_group": tools.gen_symbol_group(ticker.contract.symbol) if hasattr(ticker.contract, 'symbol') else "",
+                "asset_class": tools.gen_asset_class(ticker.contract.symbol) if hasattr(ticker.contract, 'symbol') else "STK",
+                "timestamp": datetime.now(timezone.utc),
+                "kind": "TICK"
+            }
+            
+            # Get last trade info
+            if hasattr(ticker, 'last') and ticker.last is not None and not isnan(ticker.last):
+                tick_data["price"] = tools.to_decimal(ticker.last)
+                tick_data["size"] = ticker.lastSize if hasattr(ticker, 'lastSize') else 0
+                tick_data["volume"] = ticker.volume if hasattr(ticker, 'volume') else 0
+                
+                # Broadcast tick data
+                asyncio.create_task(self.broadcast(tick_data, "TICK"))
+                
+                # Database logging
+                if not self.args['dbskip'] and self.pool:
+                    asyncio.create_task(self._log_tick_to_db(tick_data))
+                    
+        except Exception as e:
+            self._logger.error(f"Error processing tick: {e}")
+            self.monitor.record_error("tick_processing_error", str(e))
+    
+    # ---------------------------------------
+    async def on_bar_received(self, bars, hasNewBar):
+        """
+        Process bar updates.
+        
+        Args:
+            bars: RealTimeBars object from ib_async
+            hasNewBar: Boolean indicating if a new bar was added
+        """
+        try:
+            if not hasNewBar:
+                return  # Only process completed bars
+                
+            if not bars or len(bars) == 0:
+                return
+                
+            latest_bar = bars[-1]
+            bar_data = {
+                "symbol": bars.contract.symbol if hasattr(bars.contract, 'symbol') else "",
+                "symbol_group": tools.gen_symbol_group(bars.contract.symbol) if hasattr(bars.contract, 'symbol') else "",
+                "asset_class": tools.gen_asset_class(bars.contract.symbol) if hasattr(bars.contract, 'symbol') else "STK",
+                "timestamp": latest_bar.date if hasattr(latest_bar, 'date') else datetime.now(timezone.utc),
+                "open": tools.to_decimal(latest_bar.open) if hasattr(latest_bar, 'open') else 0,
+                "high": tools.to_decimal(latest_bar.high) if hasattr(latest_bar, 'high') else 0,
+                "low": tools.to_decimal(latest_bar.low) if hasattr(latest_bar, 'low') else 0,
+                "close": tools.to_decimal(latest_bar.close) if hasattr(latest_bar, 'close') else 0,
+                "volume": latest_bar.volume if hasattr(latest_bar, 'volume') else 0,
+                "kind": "BAR"
+            }
+            
+            # Broadcast bar data
+            asyncio.create_task(self.broadcast(bar_data, "BAR"))
+            
+            # Database logging
+            if not self.args['dbskip'] and self.pool:
+                asyncio.create_task(self._log_bar_to_db(bar_data))
+                
+        except Exception as e:
+            self._logger.error(f"Error processing bar: {e}")
+            self.monitor.record_error("bar_processing_error", str(e))
+    
+    # ---------------------------------------
+    async def _log_quote_to_db(self, quote_data):
+        """Log quote data to database."""
+        # TODO: Implement database logging for quotes
+        pass
+    
+    # ---------------------------------------
+    async def _log_tick_to_db(self, tick_data):
+        """Log tick data to database."""
+        # TODO: Implement database logging for ticks
+        pass
+    
+    # ---------------------------------------
+    async def _log_bar_to_db(self, bar_data):
+        """Log bar data to database."""
+        # TODO: Implement database logging for bars
+        pass
+    
+    # ---------------------------------------
+    async def _subscribe_market_data(self):
+        """
+        Subscribe to market data for all symbols in the symbols file.
+        This reads the CSV and sets up real-time data subscriptions.
+        """
+        try:
+            if not os.path.exists(self.symbols):
+                self._logger.warning(f"Symbols file not found: {self.symbols}")
+                return
+                
+            # Read symbols from CSV
+            symbols_df = pd.read_csv(self.symbols)
+            self._logger.info(f"Loading {len(symbols_df)} symbols from {self.symbols}")
+            
+            for _, row in symbols_df.iterrows():
+                try:
+                    # Create contract based on security type
+                    contract = None
+                    symbol = row.get('symbol', '')
+                    sec_type = row.get('sec_type', 'STK')
+                    exchange = row.get('exchange', 'SMART')
+                    currency = row.get('currency', 'USD')
+                    
+                    # Import contract types from ib_async if available
+                    try:
+                        from ib_async import Stock, Option, Future, Forex, Contract
+                    except ImportError:
+                        self._logger.warning("ib_async contract types not available, using ezib_async")
+                        continue
+                    
+                    if sec_type == 'STK':
+                        contract = Stock(symbol, exchange, currency)
+                    elif sec_type == 'OPT':
+                        expiry = str(row.get('expiry', ''))
+                        strike = float(row.get('strike', 0))
+                        opt_type = row.get('opt_type', 'C')
+                        contract = Option(symbol, expiry, strike, opt_type, exchange, currency=currency)
+                    elif sec_type == 'FUT':
+                        expiry = str(row.get('expiry', ''))
+                        contract = Future(symbol, expiry, exchange, currency)
+                    elif sec_type == 'CASH':
+                        # Forex pair
+                        contract = Forex(symbol)
+                    else:
+                        # Generic contract
+                        contract = Contract()
+                        contract.symbol = symbol
+                        contract.secType = sec_type
+                        contract.exchange = exchange
+                        contract.currency = currency
+                    
+                    if contract:
+                        # Request market data
+                        ticker = self.ezib.reqMktData(contract, '', False, False)
+                        
+                        # Subscribe to quote updates via ticker's updateEvent
+                        if hasattr(ticker, 'updateEvent'):
+                            ticker.updateEvent += self.on_quote_received
+                        
+                        # Store ticker reference
+                        self.tickers[symbol] = ticker
+                        
+                        # Request real-time bars if configured
+                        if self.args.get('bars', False):
+                            try:
+                                bars = self.ezib.reqRealTimeBars(
+                                    contract, 5, 'TRADES', False
+                                )
+                                if hasattr(bars, 'updateEvent'):
+                                    bars.updateEvent += self.on_bar_received
+                                self.bars[symbol] = bars
+                            except Exception as e:
+                                self._logger.warning(f"Could not subscribe to bars for {symbol}: {e}")
+                        
+                        self._logger.info(f"Subscribed to market data for {symbol}")
+                        
+                except Exception as e:
+                    self._logger.error(f"Error subscribing to {row.get('symbol', 'unknown')}: {e}")
+                    continue
+                    
+        except Exception as e:
+            self._logger.error(f"Error in _subscribe_market_data: {e}")
+            self.monitor.record_error("market_data_subscription_error", str(e))
 
     # -------------------------------------------
     def register(self, instruments):
@@ -747,6 +1127,9 @@ class Blotter:
             
             # Connect to IB with enhanced retry logic
             await self._connect_ib_with_retry()
+            
+            # Subscribe to market data for symbols
+            # await self._subscribe_market_data()
 
             # Start watching symbols file
             asyncio.create_task(self._watch_symbols_file())
